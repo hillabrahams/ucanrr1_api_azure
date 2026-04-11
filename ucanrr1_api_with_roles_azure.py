@@ -272,7 +272,11 @@ class FirebaseTokenResponse(BaseModel):
     RoleName: Optional[str] = None
     RedirectURL: Optional[str] = None
 
-# ==================== ROOT ENDPOINT ====================
+# ==================== HEALTH + ROOT ENDPOINTS ====================
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 @app.get("/")
 def read_root():
