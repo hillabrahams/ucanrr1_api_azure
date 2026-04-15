@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import Optional, List
 import pyodbc
-from datetime import datetime
+from datetime import datetime, date
 from contextlib import contextmanager
 import os
 import json
@@ -232,6 +232,23 @@ class EventUpdate(BaseModel):
     TherapistNotes: Optional[str] = None
 
 class Event(EventBase):
+    Id: int
+
+    model_config = {"from_attributes": True}
+
+# SessionDate Models
+class SessionDateBase(BaseModel):
+    ClientId: int
+    SessionDate: date
+
+class SessionDateCreate(SessionDateBase):
+    pass
+
+class SessionDateUpdate(BaseModel):
+    ClientId: Optional[int] = None
+    SessionDate: Optional[date] = None
+
+class SessionDateModel(SessionDateBase):
     Id: int
 
     model_config = {"from_attributes": True}
@@ -1469,3 +1486,103 @@ def get_therapist_statistics(therapist_id: int):
             "TotalEvents": row[0] or 0,
             "AverageScore": round(row[1], 2) if row[1] else 0.0
         }
+
+# ==================== SESSION DATE CRUD ====================
+
+@app.post("/session-dates/", response_model=SessionDateModel, status_code=status.HTTP_201_CREATED)
+def create_session_date(session_date: SessionDateCreate):
+    """Create a new session date"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT Id FROM Client WHERE Id = ?", session_date.ClientId)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Client not found")
+        cursor.execute(
+            "INSERT INTO SessionDate (ClientId, SessionDate) VALUES (?, ?)",
+            session_date.ClientId, session_date.SessionDate
+        )
+        conn.commit()
+        cursor.execute("SELECT @@IDENTITY")
+        new_id = cursor.fetchone()[0]
+        return {**session_date.model_dump(), "Id": new_id}
+
+@app.get("/session-dates/", response_model=List[SessionDateModel])
+def read_session_dates(
+    client_id: Optional[int] = Query(None, description="Filter by client ID"),
+    start_date: Optional[date] = Query(None, description="Filter session dates from this date"),
+    end_date: Optional[date] = Query(None, description="Filter session dates until this date"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return")
+):
+    """Get all session dates with optional filtering and pagination"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        query = "SELECT Id, ClientId, SessionDate FROM SessionDate WHERE 1=1"
+        params = []
+
+        if client_id is not None:
+            query += " AND ClientId = ?"
+            params.append(client_id)
+
+        if start_date is not None:
+            query += " AND SessionDate >= ?"
+            params.append(start_date)
+
+        if end_date is not None:
+            query += " AND SessionDate <= ?"
+            params.append(end_date)
+
+        query += " ORDER BY SessionDate DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([skip, limit])
+
+        cursor.execute(query, *params)
+        rows = cursor.fetchall()
+        return [{"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate} for row in rows]
+
+@app.get("/session-dates/{session_date_id}", response_model=SessionDateModel)
+def read_session_date(session_date_id: int):
+    """Get a specific session date by ID"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT Id, ClientId, SessionDate FROM SessionDate WHERE Id = ?", session_date_id)
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Session date not found")
+        return {"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate}
+
+@app.put("/session-dates/{session_date_id}", response_model=SessionDateModel)
+def update_session_date(session_date_id: int, session_date: SessionDateUpdate):
+    """Update a session date"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Id FROM SessionDate WHERE Id = ?", session_date_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Session date not found")
+
+        updates = []
+        params = []
+        for field, value in session_date.model_dump(exclude_unset=True).items():
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+        if updates:
+            params.append(session_date_id)
+            cursor.execute(
+                f"UPDATE SessionDate SET {', '.join(updates)} WHERE Id = ?",
+                *params
+            )
+            conn.commit()
+
+        return read_session_date(session_date_id)
+
+@app.delete("/session-dates/{session_date_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_session_date(session_date_id: int):
+    """Delete a session date"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM SessionDate WHERE Id = ?", session_date_id)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Session date not found")
+        conn.commit()
