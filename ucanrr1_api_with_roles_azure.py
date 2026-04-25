@@ -109,6 +109,7 @@ class AuthorizedUserBase(BaseModel):
     FullName: Optional[str] = None
     IsActive: Optional[bool] = True
     RoleID: Optional[int] = None
+    HasInformedConsent: Optional[bool] = None
 
 class AuthorizedUserCreate(AuthorizedUserBase):
     pass
@@ -119,6 +120,7 @@ class AuthorizedUserUpdate(BaseModel):
     IsActive: Optional[bool] = None
     LastLogin: Optional[datetime] = None
     RoleID: Optional[int] = None
+    HasInformedConsent: Optional[bool] = None
 
 class AuthorizedUser(AuthorizedUserBase):
     UserID: int
@@ -138,6 +140,7 @@ class AuthorizedUserWithRole(BaseModel):
     RoleID: Optional[int] = None
     RoleName: Optional[str] = None
     RedirectURL: Optional[str] = None
+    HasInformedConsent: Optional[bool] = None
 
     model_config = {"from_attributes": True}
 
@@ -599,7 +602,7 @@ def read_role_users(
             raise HTTPException(status_code=404, detail="Role not found")
 
         cursor.execute(
-            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID "
+            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent "
             "FROM AuthorizedUsers WHERE RoleID = ? ORDER BY UserID OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             role_id, skip, limit
         )
@@ -612,7 +615,8 @@ def read_role_users(
                 "IsActive": row.IsActive,
                 "CreatedAt": row.CreatedAt,
                 "LastLogin": row.LastLogin,
-                "RoleID": row.RoleID
+                "RoleID": row.RoleID,
+                "HasInformedConsent": row.HasInformedConsent
             }
             for row in rows
         ]
@@ -633,15 +637,15 @@ def create_authorized_user(user: AuthorizedUserCreate):
 
         try:
             cursor.execute(
-                "INSERT INTO AuthorizedUsers (Email, FullName, IsActive, CreatedAt, RoleID) "
-                "VALUES (?, ?, ?, GETDATE(), ?)",
-                user.Email, user.FullName, user.IsActive, user.RoleID
+                "INSERT INTO AuthorizedUsers (Email, FullName, IsActive, CreatedAt, RoleID, HasInformedConsent) "
+                "VALUES (?, ?, ?, GETDATE(), ?, ?)",
+                user.Email, user.FullName, user.IsActive, user.RoleID, user.HasInformedConsent
             )
             conn.commit()
             cursor.execute("SELECT @@IDENTITY")
             new_id = cursor.fetchone()[0]
             cursor.execute(
-                "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID "
+                "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent "
                 "FROM AuthorizedUsers WHERE UserID = ?", new_id
             )
             row = cursor.fetchone()
@@ -652,7 +656,8 @@ def create_authorized_user(user: AuthorizedUserCreate):
                 "IsActive": row.IsActive,
                 "CreatedAt": row.CreatedAt,
                 "LastLogin": row.LastLogin,
-                "RoleID": row.RoleID
+                "RoleID": row.RoleID,
+                "HasInformedConsent": row.HasInformedConsent
             }
         except pyodbc.IntegrityError:
             raise HTTPException(status_code=400, detail="Email already exists")
@@ -668,7 +673,7 @@ def read_authorized_users(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID FROM AuthorizedUsers WHERE 1=1"
+        query = "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent FROM AuthorizedUsers WHERE 1=1"
         params = []
 
         if is_active is not None:
@@ -692,7 +697,8 @@ def read_authorized_users(
                 "IsActive": row.IsActive,
                 "CreatedAt": row.CreatedAt,
                 "LastLogin": row.LastLogin,
-                "RoleID": row.RoleID
+                "RoleID": row.RoleID,
+                "HasInformedConsent": row.HasInformedConsent
             }
             for row in rows
         ]
@@ -710,7 +716,7 @@ def read_authorized_users_with_roles(
 
         query = """
             SELECT u.UserID, u.Email, u.FullName, u.IsActive, u.CreatedAt, u.LastLogin,
-                   u.RoleID, r.RoleName, r.RedirectURL
+                   u.RoleID, r.RoleName, r.RedirectURL, u.HasInformedConsent
             FROM AuthorizedUsers u
             LEFT JOIN Roles r ON u.RoleID = r.RoleID
             WHERE 1=1
@@ -740,7 +746,8 @@ def read_authorized_users_with_roles(
                 "LastLogin": row[5],
                 "RoleID": row[6],
                 "RoleName": row[7],
-                "RedirectURL": row[8]
+                "RedirectURL": row[8],
+                "HasInformedConsent": row[9]
             }
             for row in rows
         ]
@@ -751,7 +758,7 @@ def read_authorized_user(user_id: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID "
+            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent "
             "FROM AuthorizedUsers WHERE UserID = ?",
             user_id
         )
@@ -765,7 +772,8 @@ def read_authorized_user(user_id: int):
             "IsActive": row.IsActive,
             "CreatedAt": row.CreatedAt,
             "LastLogin": row.LastLogin,
-            "RoleID": row.RoleID
+            "RoleID": row.RoleID,
+            "HasInformedConsent": row.HasInformedConsent
         }
 
 @app.get("/authorized-users/{user_id}/with-role", response_model=AuthorizedUserWithRole)
@@ -776,7 +784,7 @@ def read_authorized_user_with_role(user_id: int):
         cursor.execute(
             """
             SELECT u.UserID, u.Email, u.FullName, u.IsActive, u.CreatedAt, u.LastLogin,
-                   u.RoleID, r.RoleName, r.RedirectURL
+                   u.RoleID, r.RoleName, r.RedirectURL, u.HasInformedConsent
             FROM AuthorizedUsers u
             LEFT JOIN Roles r ON u.RoleID = r.RoleID
             WHERE u.UserID = ?
@@ -795,7 +803,8 @@ def read_authorized_user_with_role(user_id: int):
             "LastLogin": row[5],
             "RoleID": row[6],
             "RoleName": row[7],
-            "RedirectURL": row[8]
+            "RedirectURL": row[8],
+            "HasInformedConsent": row[9]
         }
 
 @app.get("/authorized-users/email/{email}", response_model=AuthorizedUser)
@@ -804,7 +813,7 @@ def read_authorized_user_by_email(email: str):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID "
+            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent "
             "FROM AuthorizedUsers WHERE Email = ?",
             email
         )
@@ -818,7 +827,8 @@ def read_authorized_user_by_email(email: str):
             "IsActive": row.IsActive,
             "CreatedAt": row.CreatedAt,
             "LastLogin": row.LastLogin,
-            "RoleID": row.RoleID
+            "RoleID": row.RoleID,
+            "HasInformedConsent": row.HasInformedConsent
         }
 
 @app.put("/authorized-users/{user_id}", response_model=AuthorizedUser)
@@ -857,6 +867,9 @@ def update_authorized_user(user_id: int, user: AuthorizedUserUpdate):
         if user.RoleID is not None:
             updates.append("RoleID = ?")
             params.append(user.RoleID)
+        if user.HasInformedConsent is not None:
+            updates.append("HasInformedConsent = ?")
+            params.append(user.HasInformedConsent)
 
         if updates:
             params.append(user_id)
