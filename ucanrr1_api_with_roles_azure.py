@@ -256,6 +256,70 @@ class SessionDateModel(SessionDateBase):
 
     model_config = {"from_attributes": True}
 
+# SafetyAssessment Models
+class SafetyAssessmentBase(BaseModel):
+    EventId: Optional[int] = None
+    ClientId: int
+    RiskTier: int
+    RiskLabel: str
+    HasSuicidalIdeation: bool = False
+    HasSelfHarm: bool = False
+    HasOtherHarm: bool = False
+    HasExtremeAbuse: bool = False
+    HasHeatedArgument: bool = False
+    HasCrisisLanguage: bool = False
+    MentionsSubstanceUse: bool = False
+    MentionsWeaponAccess: bool = False
+    MentionsChildSafetyConcern: bool = False
+    AmbiguousLethalCuriosity: bool = False
+    PartnerSharePolicy: str
+    TherapistSharePolicy: str
+    ShowCrisisBanner: bool = False
+    ShowCrisisResources: bool = False
+    SuggestedUiFlow: str
+    IsUrgentForTherapist: bool = False
+    NotesForTherapist: Optional[str] = None
+    Explanation: str
+    ApiVersion: str = "1.2.0"
+
+class SafetyAssessmentCreate(SafetyAssessmentBase):
+    pass
+
+class SafetyAssessmentUpdate(BaseModel):
+    EventId: Optional[int] = None
+    RiskTier: Optional[int] = None
+    RiskLabel: Optional[str] = None
+    HasSuicidalIdeation: Optional[bool] = None
+    HasSelfHarm: Optional[bool] = None
+    HasOtherHarm: Optional[bool] = None
+    HasExtremeAbuse: Optional[bool] = None
+    HasHeatedArgument: Optional[bool] = None
+    HasCrisisLanguage: Optional[bool] = None
+    MentionsSubstanceUse: Optional[bool] = None
+    MentionsWeaponAccess: Optional[bool] = None
+    MentionsChildSafetyConcern: Optional[bool] = None
+    AmbiguousLethalCuriosity: Optional[bool] = None
+    PartnerSharePolicy: Optional[str] = None
+    TherapistSharePolicy: Optional[str] = None
+    ShowCrisisBanner: Optional[bool] = None
+    ShowCrisisResources: Optional[bool] = None
+    SuggestedUiFlow: Optional[str] = None
+    IsUrgentForTherapist: Optional[bool] = None
+    NotesForTherapist: Optional[str] = None
+    Explanation: Optional[str] = None
+    ApiVersion: Optional[str] = None
+
+class SafetyAssessmentAcknowledge(BaseModel):
+    TherapistAcknowledgedById: int
+
+class SafetyAssessmentModel(SafetyAssessmentBase):
+    Id: int
+    TherapistAcknowledgedAt: Optional[datetime] = None
+    TherapistAcknowledgedById: Optional[int] = None
+    AssessedAt: datetime
+
+    model_config = {"from_attributes": True}
+
 # Statistics Models
 class ClientStatistics(BaseModel):
     ClientId: int
@@ -1598,4 +1662,193 @@ def delete_session_date(session_date_id: int):
         cursor.execute("DELETE FROM SessionDate WHERE Id = ?", session_date_id)
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Session date not found")
+        conn.commit()
+
+# ==================== SAFETY ASSESSMENT CRUD ====================
+
+_SA_COLUMNS = """
+    Id, EventId, ClientId, RiskTier, RiskLabel,
+    HasSuicidalIdeation, HasSelfHarm, HasOtherHarm, HasExtremeAbuse,
+    HasHeatedArgument, HasCrisisLanguage, MentionsSubstanceUse,
+    MentionsWeaponAccess, MentionsChildSafetyConcern, AmbiguousLethalCuriosity,
+    PartnerSharePolicy, TherapistSharePolicy,
+    ShowCrisisBanner, ShowCrisisResources, SuggestedUiFlow,
+    IsUrgentForTherapist, NotesForTherapist,
+    Explanation, ApiVersion, TherapistAcknowledgedAt, TherapistAcknowledgedById, AssessedAt
+"""
+
+def _sa_row(row):
+    return {
+        "Id": row.Id, "EventId": row.EventId, "ClientId": row.ClientId,
+        "RiskTier": row.RiskTier, "RiskLabel": row.RiskLabel,
+        "HasSuicidalIdeation": bool(row.HasSuicidalIdeation),
+        "HasSelfHarm": bool(row.HasSelfHarm),
+        "HasOtherHarm": bool(row.HasOtherHarm),
+        "HasExtremeAbuse": bool(row.HasExtremeAbuse),
+        "HasHeatedArgument": bool(row.HasHeatedArgument),
+        "HasCrisisLanguage": bool(row.HasCrisisLanguage),
+        "MentionsSubstanceUse": bool(row.MentionsSubstanceUse),
+        "MentionsWeaponAccess": bool(row.MentionsWeaponAccess),
+        "MentionsChildSafetyConcern": bool(row.MentionsChildSafetyConcern),
+        "AmbiguousLethalCuriosity": bool(row.AmbiguousLethalCuriosity),
+        "PartnerSharePolicy": row.PartnerSharePolicy,
+        "TherapistSharePolicy": row.TherapistSharePolicy,
+        "ShowCrisisBanner": bool(row.ShowCrisisBanner),
+        "ShowCrisisResources": bool(row.ShowCrisisResources),
+        "SuggestedUiFlow": row.SuggestedUiFlow,
+        "IsUrgentForTherapist": bool(row.IsUrgentForTherapist),
+        "NotesForTherapist": row.NotesForTherapist,
+        "Explanation": row.Explanation,
+        "ApiVersion": row.ApiVersion,
+        "TherapistAcknowledgedAt": row.TherapistAcknowledgedAt,
+        "TherapistAcknowledgedById": row.TherapistAcknowledgedById,
+        "AssessedAt": row.AssessedAt,
+    }
+
+@app.post("/safety-assessments/", response_model=SafetyAssessmentModel, status_code=status.HTTP_201_CREATED)
+def create_safety_assessment(assessment: SafetyAssessmentCreate):
+    """Create a new safety assessment"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Id FROM Client WHERE Id = ?", assessment.ClientId)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Client not found")
+
+        if assessment.EventId is not None:
+            cursor.execute("SELECT Id FROM Event WHERE Id = ?", assessment.EventId)
+            if not cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Event not found")
+
+        cursor.execute(
+            """
+            INSERT INTO SafetyAssessment (
+                EventId, ClientId, RiskTier, RiskLabel,
+                HasSuicidalIdeation, HasSelfHarm, HasOtherHarm, HasExtremeAbuse,
+                HasHeatedArgument, HasCrisisLanguage, MentionsSubstanceUse,
+                MentionsWeaponAccess, MentionsChildSafetyConcern, AmbiguousLethalCuriosity,
+                PartnerSharePolicy, TherapistSharePolicy,
+                ShowCrisisBanner, ShowCrisisResources, SuggestedUiFlow,
+                IsUrgentForTherapist, NotesForTherapist,
+                Explanation, ApiVersion
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            assessment.EventId, assessment.ClientId, assessment.RiskTier, assessment.RiskLabel,
+            assessment.HasSuicidalIdeation, assessment.HasSelfHarm, assessment.HasOtherHarm, assessment.HasExtremeAbuse,
+            assessment.HasHeatedArgument, assessment.HasCrisisLanguage, assessment.MentionsSubstanceUse,
+            assessment.MentionsWeaponAccess, assessment.MentionsChildSafetyConcern, assessment.AmbiguousLethalCuriosity,
+            assessment.PartnerSharePolicy, assessment.TherapistSharePolicy,
+            assessment.ShowCrisisBanner, assessment.ShowCrisisResources, assessment.SuggestedUiFlow,
+            assessment.IsUrgentForTherapist, assessment.NotesForTherapist,
+            assessment.Explanation, assessment.ApiVersion
+        )
+        conn.commit()
+
+        cursor.execute("SELECT @@IDENTITY")
+        new_id = int(cursor.fetchone()[0])
+
+        cursor.execute(f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE Id = ?", new_id)
+        return _sa_row(cursor.fetchone())
+
+@app.get("/safety-assessments/", response_model=List[SafetyAssessmentModel])
+def read_safety_assessments(
+    client_id: Optional[int] = Query(None),
+    event_id: Optional[int] = Query(None),
+    is_urgent: Optional[bool] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000)
+):
+    """List safety assessments with optional filters"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        query = f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE 1=1"
+        params = []
+
+        if client_id is not None:
+            query += " AND ClientId = ?"
+            params.append(client_id)
+        if event_id is not None:
+            query += " AND EventId = ?"
+            params.append(event_id)
+        if is_urgent is not None:
+            query += " AND IsUrgentForTherapist = ?"
+            params.append(is_urgent)
+
+        query += " ORDER BY AssessedAt DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([skip, limit])
+
+        cursor.execute(query, *params)
+        return [_sa_row(row) for row in cursor.fetchall()]
+
+@app.get("/safety-assessments/{assessment_id}", response_model=SafetyAssessmentModel)
+def read_safety_assessment(assessment_id: int):
+    """Get a specific safety assessment by ID"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Safety assessment not found")
+        return _sa_row(row)
+
+@app.put("/safety-assessments/{assessment_id}", response_model=SafetyAssessmentModel)
+def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpdate):
+    """Update a safety assessment"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Id FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Safety assessment not found")
+
+        data = assessment.model_dump(exclude_unset=True)
+
+        if "EventId" in data and data["EventId"] is not None:
+            cursor.execute("SELECT Id FROM Event WHERE Id = ?", data["EventId"])
+            if not cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Event not found")
+
+        if data:
+            updates = [f"{field} = ?" for field in data]
+            params = list(data.values())
+            params.append(assessment_id)
+            cursor.execute(
+                f"UPDATE SafetyAssessment SET {', '.join(updates)} WHERE Id = ?",
+                *params
+            )
+            conn.commit()
+
+        return read_safety_assessment(assessment_id)
+
+@app.put("/safety-assessments/{assessment_id}/acknowledge", response_model=SafetyAssessmentModel)
+def acknowledge_safety_assessment(assessment_id: int, body: SafetyAssessmentAcknowledge):
+    """Mark a safety assessment as acknowledged by a therapist"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Id FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Safety assessment not found")
+
+        cursor.execute(
+            """
+            UPDATE SafetyAssessment
+            SET TherapistAcknowledgedAt = GETDATE(), TherapistAcknowledgedById = ?
+            WHERE Id = ?
+            """,
+            body.TherapistAcknowledgedById, assessment_id
+        )
+        conn.commit()
+
+    return read_safety_assessment(assessment_id)
+
+@app.delete("/safety-assessments/{assessment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_safety_assessment(assessment_id: int):
+    """Delete a safety assessment"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Safety assessment not found")
         conn.commit()
