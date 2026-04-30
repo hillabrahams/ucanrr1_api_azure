@@ -260,6 +260,8 @@ class SessionDateModel(SessionDateBase):
 class SafetyAssessmentBase(BaseModel):
     EventId: Optional[int] = None
     ClientId: int
+    IsClient1: bool = False
+    IsClient2: bool = False
     RiskTier: int
     RiskLabel: str
     HasSuicidalIdeation: bool = False
@@ -287,6 +289,8 @@ class SafetyAssessmentCreate(SafetyAssessmentBase):
 
 class SafetyAssessmentUpdate(BaseModel):
     EventId: Optional[int] = None
+    IsClient1: Optional[bool] = None
+    IsClient2: Optional[bool] = None
     RiskTier: Optional[int] = None
     RiskLabel: Optional[str] = None
     HasSuicidalIdeation: Optional[bool] = None
@@ -1667,7 +1671,7 @@ def delete_session_date(session_date_id: int):
 # ==================== SAFETY ASSESSMENT CRUD ====================
 
 _SA_COLUMNS = """
-    Id, EventId, ClientId, RiskTier, RiskLabel,
+    Id, EventId, ClientId, IsClient1, IsClient2, RiskTier, RiskLabel,
     HasSuicidalIdeation, HasSelfHarm, HasOtherHarm, HasExtremeAbuse,
     HasHeatedArgument, HasCrisisLanguage, MentionsSubstanceUse,
     MentionsWeaponAccess, MentionsChildSafetyConcern, AmbiguousLethalCuriosity,
@@ -1680,6 +1684,7 @@ _SA_COLUMNS = """
 def _sa_row(row):
     return {
         "Id": row.Id, "EventId": row.EventId, "ClientId": row.ClientId,
+        "IsClient1": bool(row.IsClient1), "IsClient2": bool(row.IsClient2),
         "RiskTier": row.RiskTier, "RiskLabel": row.RiskLabel,
         "HasSuicidalIdeation": bool(row.HasSuicidalIdeation),
         "HasSelfHarm": bool(row.HasSelfHarm),
@@ -1723,7 +1728,7 @@ def create_safety_assessment(assessment: SafetyAssessmentCreate):
         cursor.execute(
             """
             INSERT INTO SafetyAssessment (
-                EventId, ClientId, RiskTier, RiskLabel,
+                EventId, ClientId, IsClient1, IsClient2, RiskTier, RiskLabel,
                 HasSuicidalIdeation, HasSelfHarm, HasOtherHarm, HasExtremeAbuse,
                 HasHeatedArgument, HasCrisisLanguage, MentionsSubstanceUse,
                 MentionsWeaponAccess, MentionsChildSafetyConcern, AmbiguousLethalCuriosity,
@@ -1731,9 +1736,9 @@ def create_safety_assessment(assessment: SafetyAssessmentCreate):
                 ShowCrisisBanner, ShowCrisisResources, SuggestedUiFlow,
                 IsUrgentForTherapist, NotesForTherapist,
                 Explanation, ApiVersion
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            assessment.EventId, assessment.ClientId, assessment.RiskTier, assessment.RiskLabel,
+            assessment.EventId, assessment.ClientId, assessment.IsClient1, assessment.IsClient2, assessment.RiskTier, assessment.RiskLabel,
             assessment.HasSuicidalIdeation, assessment.HasSelfHarm, assessment.HasOtherHarm, assessment.HasExtremeAbuse,
             assessment.HasHeatedArgument, assessment.HasCrisisLanguage, assessment.MentionsSubstanceUse,
             assessment.MentionsWeaponAccess, assessment.MentionsChildSafetyConcern, assessment.AmbiguousLethalCuriosity,
