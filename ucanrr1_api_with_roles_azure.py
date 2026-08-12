@@ -147,16 +147,12 @@ class AuthorizedUserWithRole(BaseModel):
 # Therapist Models
 class TherapistBase(BaseModel):
     TherapistUserName: str
-    ThearapistPassword: str
-    ClientId: int
 
 class TherapistCreate(TherapistBase):
     pass
 
 class TherapistUpdate(BaseModel):
     TherapistUserName: Optional[str] = None
-    ThearapistPassword: Optional[str] = None
-    ClientId: Optional[int] = None
 
 class Therapist(TherapistBase):
     Id: int
@@ -989,23 +985,21 @@ def create_therapist(therapist: TherapistCreate):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO Therapist (TherapistUserName, ThearapistPassword, ClientId, CreatedDate, UpdatedDate) "
-            "VALUES (?, ?, ?, GETDATE(), GETDATE())",
-            therapist.TherapistUserName, therapist.ThearapistPassword, therapist.ClientId
+            "INSERT INTO Therapist (TherapistUserName, CreatedDate, UpdatedDate) "
+            "VALUES (?, GETDATE(), GETDATE())",
+            therapist.TherapistUserName
         )
         conn.commit()
         cursor.execute("SELECT @@IDENTITY")
         new_id = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT Id, TherapistUserName, ThearapistPassword, ClientId, CreatedDate, UpdatedDate "
+            "SELECT Id, TherapistUserName, CreatedDate, UpdatedDate "
             "FROM Therapist WHERE Id = ?", new_id
         )
         row = cursor.fetchone()
         return {
             "Id": row.Id,
             "TherapistUserName": row.TherapistUserName.strip(),
-            "ThearapistPassword": row.ThearapistPassword.strip(),
-            "ClientId": row.ClientId,
             "CreatedDate": row.CreatedDate,
             "UpdatedDate": row.UpdatedDate
         }
@@ -1019,7 +1013,7 @@ def read_therapists(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Id, TherapistUserName, ThearapistPassword, ClientId, CreatedDate, UpdatedDate "
+            "SELECT Id, TherapistUserName, CreatedDate, UpdatedDate "
             "FROM Therapist ORDER BY Id OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             skip, limit
         )
@@ -1028,8 +1022,6 @@ def read_therapists(
             {
                 "Id": row.Id,
                 "TherapistUserName": row.TherapistUserName.strip(),
-                "ThearapistPassword": row.ThearapistPassword.strip(),
-                "ClientId": row.ClientId,
                 "CreatedDate": row.CreatedDate,
                 "UpdatedDate": row.UpdatedDate
             }
@@ -1042,7 +1034,7 @@ def read_therapist(therapist_id: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Id, TherapistUserName, ThearapistPassword, ClientId, CreatedDate, UpdatedDate "
+            "SELECT Id, TherapistUserName, CreatedDate, UpdatedDate "
             "FROM Therapist WHERE Id = ?",
             therapist_id
         )
@@ -1052,8 +1044,6 @@ def read_therapist(therapist_id: int):
         return {
             "Id": row.Id,
             "TherapistUserName": row.TherapistUserName.strip(),
-            "ThearapistPassword": row.ThearapistPassword.strip(),
-            "ClientId": row.ClientId,
             "CreatedDate": row.CreatedDate,
             "UpdatedDate": row.UpdatedDate
         }
@@ -1075,12 +1065,6 @@ def update_therapist(therapist_id: int, therapist: TherapistUpdate):
         if therapist.TherapistUserName is not None:
             updates.append("TherapistUserName = ?")
             params.append(therapist.TherapistUserName)
-        if therapist.ThearapistPassword is not None:
-            updates.append("ThearapistPassword = ?")
-            params.append(therapist.ThearapistPassword)
-        if therapist.ClientId is not None:
-            updates.append("ClientId = ?")
-            params.append(therapist.ClientId)
 
         params.append(therapist_id)
         cursor.execute(
