@@ -320,6 +320,31 @@ class SafetyAssessmentModel(SafetyAssessmentBase):
 
     model_config = {"from_attributes": True}
 
+# Study Models
+class StudyBase(BaseModel):
+    Name: str
+    StartDate: date
+    Active: Optional[bool] = True
+    TherapistCount: Optional[int] = 0
+    ClientCount: Optional[int] = 0
+
+class StudyCreate(StudyBase):
+    pass
+
+class StudyUpdate(BaseModel):
+    Name: Optional[str] = None
+    StartDate: Optional[date] = None
+    Active: Optional[bool] = None
+    TherapistCount: Optional[int] = None
+    ClientCount: Optional[int] = None
+
+class Study(StudyBase):
+    Id: int
+    CreatedDate: Optional[datetime] = None
+    UpdatedDate: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
 # Statistics Models
 class ClientStatistics(BaseModel):
     ClientId: int
@@ -419,6 +444,13 @@ def read_root():
                 "get": "GET /events/{event_id}",
                 "update": "PUT /events/{event_id}",
                 "delete": "DELETE /events/{event_id}"
+            },
+            "studies": {
+                "list": "GET /studies/",
+                "create": "POST /studies/",
+                "get": "GET /studies/{study_id}",
+                "update": "PUT /studies/{study_id}",
+                "delete": "DELETE /studies/{study_id}"
             }
         }
     }
@@ -1840,4 +1872,133 @@ def delete_safety_assessment(assessment_id: int):
         cursor.execute("DELETE FROM SafetyAssessment WHERE Id = ?", assessment_id)
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Safety assessment not found")
+        conn.commit()
+
+# ==================== STUDY CRUD ====================
+
+@app.post("/studies/", response_model=Study, status_code=status.HTTP_201_CREATED)
+def create_study(study: StudyCreate):
+    """Create a new study"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO Study (Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate) "
+            "VALUES (?, ?, ?, ?, ?, GETDATE(), GETDATE())",
+            study.Name, study.StartDate, study.Active, study.TherapistCount, study.ClientCount
+        )
+        conn.commit()
+        cursor.execute("SELECT @@IDENTITY")
+        new_id = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate "
+            "FROM Study WHERE Id = ?", new_id
+        )
+        row = cursor.fetchone()
+        return {
+            "Id": row.Id,
+            "Name": row.Name.strip(),
+            "StartDate": row.StartDate,
+            "Active": row.Active,
+            "TherapistCount": row.TherapistCount,
+            "ClientCount": row.ClientCount,
+            "CreatedDate": row.CreatedDate,
+            "UpdatedDate": row.UpdatedDate
+        }
+
+@app.get("/studies/", response_model=List[Study])
+def read_studies(
+    active: Optional[bool] = Query(None, description="Filter by active status"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return")
+):
+    """Get all studies with optional filtering and pagination"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        query = "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate FROM Study WHERE 1=1"
+        params = []
+
+        if active is not None:
+            query += " AND Active = ?"
+            params.append(active)
+
+        query += " ORDER BY Id OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([skip, limit])
+
+        cursor.execute(query, *params)
+        rows = cursor.fetchall()
+        return [
+            {
+                "Id": row.Id,
+                "Name": row.Name.strip(),
+                "StartDate": row.StartDate,
+                "Active": row.Active,
+                "TherapistCount": row.TherapistCount,
+                "ClientCount": row.ClientCount,
+                "CreatedDate": row.CreatedDate,
+                "UpdatedDate": row.UpdatedDate
+            }
+            for row in rows
+        ]
+
+@app.get("/studies/{study_id}", response_model=Study)
+def read_study(study_id: int):
+    """Get a specific study by ID"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate "
+            "FROM Study WHERE Id = ?",
+            study_id
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Study not found")
+        return {
+            "Id": row.Id,
+            "Name": row.Name.strip(),
+            "StartDate": row.StartDate,
+            "Active": row.Active,
+            "TherapistCount": row.TherapistCount,
+            "ClientCount": row.ClientCount,
+            "CreatedDate": row.CreatedDate,
+            "UpdatedDate": row.UpdatedDate
+        }
+
+@app.put("/studies/{study_id}", response_model=Study)
+def update_study(study_id: int, study: StudyUpdate):
+    """Update a study"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Id FROM Study WHERE Id = ?", study_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Study not found")
+
+        data = study.model_dump(exclude_unset=True)
+
+        updates = ["UpdatedDate = GETDATE()"]
+        params = []
+        for field, value in data.items():
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+        if params:
+            params.append(study_id)
+            cursor.execute(
+                f"UPDATE Study SET {', '.join(updates)} WHERE Id = ?",
+                *params
+            )
+            conn.commit()
+
+        return read_study(study_id)
+
+@app.delete("/studies/{study_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_study(study_id: int):
+    """Delete a study"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM Study WHERE Id = ?", study_id)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Study not found")
         conn.commit()
