@@ -444,6 +444,8 @@ class AssessmentResponseBase(BaseModel):
     Study_Question_ID: int
     Study_Answer_ID: int
     Answer_Value: Optional[int] = None
+    IsClient1: Optional[bool] = None
+    IsClient2: Optional[bool] = None
 
 class AssessmentResponseCreate(AssessmentResponseBase):
     pass
@@ -454,6 +456,8 @@ class AssessmentResponseUpdate(BaseModel):
     Study_Question_ID: Optional[int] = None
     Study_Answer_ID: Optional[int] = None
     Answer_Value: Optional[int] = None
+    IsClient1: Optional[bool] = None
+    IsClient2: Optional[bool] = None
 
 class AssessmentResponse(AssessmentResponseBase):
     Assessment_Response_ID: int
@@ -2781,16 +2785,16 @@ def create_assessment_response(response: AssessmentResponseCreate):
         _validate_assessment_response_fks(cursor, response.model_dump())
 
         cursor.execute(
-            "INSERT INTO Assessment_Response (Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO Assessment_Response (Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, IsClient1, IsClient2) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             response.Client_ID, response.Assessment_ID, response.Study_Question_ID,
-            response.Study_Answer_ID, response.Answer_Value
+            response.Study_Answer_ID, response.Answer_Value, response.IsClient1, response.IsClient2
         )
         conn.commit()
         cursor.execute("SELECT @@IDENTITY")
         new_id = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, DateCreated, DateUpdated "
+            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, IsClient1, IsClient2, DateCreated, DateUpdated "
             "FROM Assessment_Response WHERE Assessment_Response_ID = ?", new_id
         )
         row = cursor.fetchone()
@@ -2801,6 +2805,8 @@ def create_assessment_response(response: AssessmentResponseCreate):
             "Study_Question_ID": row.Study_Question_ID,
             "Study_Answer_ID": row.Study_Answer_ID,
             "Answer_Value": row.Answer_Value,
+            "IsClient1": row.IsClient1,
+            "IsClient2": row.IsClient2,
             "DateCreated": row.DateCreated,
             "DateUpdated": row.DateUpdated
         }
@@ -2818,7 +2824,7 @@ def read_assessment_responses(
         cursor = conn.cursor()
 
         query = (
-            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, DateCreated, DateUpdated "
+            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, IsClient1, IsClient2, DateCreated, DateUpdated "
             "FROM Assessment_Response WHERE 1=1"
         )
         params = []
@@ -2848,6 +2854,8 @@ def read_assessment_responses(
                 "Study_Question_ID": row.Study_Question_ID,
                 "Study_Answer_ID": row.Study_Answer_ID,
                 "Answer_Value": row.Answer_Value,
+                "IsClient1": row.IsClient1,
+                "IsClient2": row.IsClient2,
                 "DateCreated": row.DateCreated,
                 "DateUpdated": row.DateUpdated
             }
@@ -2860,7 +2868,7 @@ def read_assessment_response(assessment_response_id: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, DateCreated, DateUpdated "
+            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, IsClient1, IsClient2, DateCreated, DateUpdated "
             "FROM Assessment_Response WHERE Assessment_Response_ID = ?",
             assessment_response_id
         )
@@ -2874,6 +2882,8 @@ def read_assessment_response(assessment_response_id: int):
             "Study_Question_ID": row.Study_Question_ID,
             "Study_Answer_ID": row.Study_Answer_ID,
             "Answer_Value": row.Answer_Value,
+            "IsClient1": row.IsClient1,
+            "IsClient2": row.IsClient2,
             "DateCreated": row.DateCreated,
             "DateUpdated": row.DateUpdated
         }
