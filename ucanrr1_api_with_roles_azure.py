@@ -414,6 +414,29 @@ class StudyQuestion(StudyQuestionBase):
 
     model_config = {"from_attributes": True}
 
+# Study_Answers Models
+class StudyAnswerBase(BaseModel):
+    Study_Question_ID: int
+    Answer_Text: str
+    Answer_Value: Optional[int] = None
+    Answer_Order: Optional[int] = None
+
+class StudyAnswerCreate(StudyAnswerBase):
+    pass
+
+class StudyAnswerUpdate(BaseModel):
+    Study_Question_ID: Optional[int] = None
+    Answer_Text: Optional[str] = None
+    Answer_Value: Optional[int] = None
+    Answer_Order: Optional[int] = None
+
+class StudyAnswer(StudyAnswerBase):
+    Study_Answer_ID: int
+    DateCreated: Optional[datetime] = None
+    DateUpdated: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
 # Statistics Models
 class ClientStatistics(BaseModel):
     ClientId: int
@@ -542,6 +565,13 @@ def read_root():
                 "get": "GET /study-questions/{study_question_id}",
                 "update": "PUT /study-questions/{study_question_id}",
                 "delete": "DELETE /study-questions/{study_question_id}"
+            },
+            "study_answers": {
+                "list": "GET /study-answers/",
+                "create": "POST /study-answers/",
+                "get": "GET /study-answers/{study_answer_id}",
+                "update": "PUT /study-answers/{study_answer_id}",
+                "delete": "DELETE /study-answers/{study_answer_id}"
             }
         }
     }
@@ -2548,4 +2578,141 @@ def delete_study_question(study_question_id: int):
         cursor.execute("DELETE FROM Study_Questions WHERE Study_Question_ID = ?", study_question_id)
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Study question not found")
+        conn.commit()
+
+# ==================== STUDY_ANSWERS CRUD ====================
+
+@app.post("/study-answers/", response_model=StudyAnswer, status_code=status.HTTP_201_CREATED)
+def create_study_answer(study_answer: StudyAnswerCreate):
+    """Create a new study answer"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Study_Question_ID FROM Study_Questions WHERE Study_Question_ID = ?", study_answer.Study_Question_ID)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Study question not found")
+
+        cursor.execute(
+            "INSERT INTO Study_Answers (Study_Question_ID, Answer_Text, Answer_Value, Answer_Order) "
+            "VALUES (?, ?, ?, ?)",
+            study_answer.Study_Question_ID, study_answer.Answer_Text,
+            study_answer.Answer_Value, study_answer.Answer_Order
+        )
+        conn.commit()
+        cursor.execute("SELECT @@IDENTITY")
+        new_id = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT Study_Answer_ID, Study_Question_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
+            "FROM Study_Answers WHERE Study_Answer_ID = ?", new_id
+        )
+        row = cursor.fetchone()
+        return {
+            "Study_Answer_ID": row.Study_Answer_ID,
+            "Study_Question_ID": row.Study_Question_ID,
+            "Answer_Text": row.Answer_Text,
+            "Answer_Value": row.Answer_Value,
+            "Answer_Order": row.Answer_Order,
+            "DateCreated": row.DateCreated,
+            "DateUpdated": row.DateUpdated
+        }
+
+@app.get("/study-answers/", response_model=List[StudyAnswer])
+def read_study_answers(
+    study_question_id: Optional[int] = Query(None, description="Filter by study question ID"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return")
+):
+    """Get all study answers with optional filtering and pagination"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        query = "SELECT Study_Answer_ID, Study_Question_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated FROM Study_Answers WHERE 1=1"
+        params = []
+
+        if study_question_id is not None:
+            query += " AND Study_Question_ID = ?"
+            params.append(study_question_id)
+
+        query += " ORDER BY Answer_Order, Study_Answer_ID OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([skip, limit])
+
+        cursor.execute(query, *params)
+        rows = cursor.fetchall()
+        return [
+            {
+                "Study_Answer_ID": row.Study_Answer_ID,
+                "Study_Question_ID": row.Study_Question_ID,
+                "Answer_Text": row.Answer_Text,
+                "Answer_Value": row.Answer_Value,
+                "Answer_Order": row.Answer_Order,
+                "DateCreated": row.DateCreated,
+                "DateUpdated": row.DateUpdated
+            }
+            for row in rows
+        ]
+
+@app.get("/study-answers/{study_answer_id}", response_model=StudyAnswer)
+def read_study_answer(study_answer_id: int):
+    """Get a specific study answer by ID"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT Study_Answer_ID, Study_Question_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
+            "FROM Study_Answers WHERE Study_Answer_ID = ?",
+            study_answer_id
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Study answer not found")
+        return {
+            "Study_Answer_ID": row.Study_Answer_ID,
+            "Study_Question_ID": row.Study_Question_ID,
+            "Answer_Text": row.Answer_Text,
+            "Answer_Value": row.Answer_Value,
+            "Answer_Order": row.Answer_Order,
+            "DateCreated": row.DateCreated,
+            "DateUpdated": row.DateUpdated
+        }
+
+@app.put("/study-answers/{study_answer_id}", response_model=StudyAnswer)
+def update_study_answer(study_answer_id: int, study_answer: StudyAnswerUpdate):
+    """Update a study answer"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Study_Answer_ID FROM Study_Answers WHERE Study_Answer_ID = ?", study_answer_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Study answer not found")
+
+        data = study_answer.model_dump(exclude_unset=True)
+
+        if "Study_Question_ID" in data:
+            cursor.execute("SELECT Study_Question_ID FROM Study_Questions WHERE Study_Question_ID = ?", data["Study_Question_ID"])
+            if not cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Study question not found")
+
+        updates = ["DateUpdated = SYSUTCDATETIME()"]
+        params = []
+        for field, value in data.items():
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+        if params:
+            params.append(study_answer_id)
+            cursor.execute(
+                f"UPDATE Study_Answers SET {', '.join(updates)} WHERE Study_Answer_ID = ?",
+                *params
+            )
+            conn.commit()
+
+        return read_study_answer(study_answer_id)
+
+@app.delete("/study-answers/{study_answer_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_study_answer(study_answer_id: int):
+    """Delete a study answer"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM Study_Answers WHERE Study_Answer_ID = ?", study_answer_id)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Study answer not found")
         conn.commit()
