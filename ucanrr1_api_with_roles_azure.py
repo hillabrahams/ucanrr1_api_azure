@@ -437,6 +437,31 @@ class StudyAnswer(StudyAnswerBase):
 
     model_config = {"from_attributes": True}
 
+# Assessment_Response Models
+class AssessmentResponseBase(BaseModel):
+    Client_ID: int
+    Assessment_ID: int
+    Study_Question_ID: int
+    Study_Answer_ID: int
+    Answer_Value: Optional[int] = None
+
+class AssessmentResponseCreate(AssessmentResponseBase):
+    pass
+
+class AssessmentResponseUpdate(BaseModel):
+    Client_ID: Optional[int] = None
+    Assessment_ID: Optional[int] = None
+    Study_Question_ID: Optional[int] = None
+    Study_Answer_ID: Optional[int] = None
+    Answer_Value: Optional[int] = None
+
+class AssessmentResponse(AssessmentResponseBase):
+    Assessment_Response_ID: int
+    DateCreated: Optional[datetime] = None
+    DateUpdated: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
 # Statistics Models
 class ClientStatistics(BaseModel):
     ClientId: int
@@ -572,6 +597,13 @@ def read_root():
                 "get": "GET /study-answers/{study_answer_id}",
                 "update": "PUT /study-answers/{study_answer_id}",
                 "delete": "DELETE /study-answers/{study_answer_id}"
+            },
+            "assessment_responses": {
+                "list": "GET /assessment-responses/",
+                "create": "POST /assessment-responses/",
+                "get": "GET /assessment-responses/{assessment_response_id}",
+                "update": "PUT /assessment-responses/{assessment_response_id}",
+                "delete": "DELETE /assessment-responses/{assessment_response_id}"
             }
         }
     }
@@ -2715,4 +2747,173 @@ def delete_study_answer(study_answer_id: int):
         cursor.execute("DELETE FROM Study_Answers WHERE Study_Answer_ID = ?", study_answer_id)
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Study answer not found")
+        conn.commit()
+
+# ==================== ASSESSMENT_RESPONSE CRUD ====================
+
+def _validate_assessment_response_fks(cursor, data: dict):
+    if "Client_ID" in data:
+        cursor.execute("SELECT Id FROM Client WHERE Id = ?", data["Client_ID"])
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Client not found")
+
+    if "Assessment_ID" in data:
+        cursor.execute("SELECT Id FROM Assessment WHERE Id = ?", data["Assessment_ID"])
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Assessment not found")
+
+    if "Study_Question_ID" in data:
+        cursor.execute("SELECT Study_Question_ID FROM Study_Questions WHERE Study_Question_ID = ?", data["Study_Question_ID"])
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Study question not found")
+
+    if "Study_Answer_ID" in data:
+        cursor.execute("SELECT Study_Answer_ID FROM Study_Answers WHERE Study_Answer_ID = ?", data["Study_Answer_ID"])
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Study answer not found")
+
+@app.post("/assessment-responses/", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
+def create_assessment_response(response: AssessmentResponseCreate):
+    """Create a new assessment response"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        _validate_assessment_response_fks(cursor, response.model_dump())
+
+        cursor.execute(
+            "INSERT INTO Assessment_Response (Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            response.Client_ID, response.Assessment_ID, response.Study_Question_ID,
+            response.Study_Answer_ID, response.Answer_Value
+        )
+        conn.commit()
+        cursor.execute("SELECT @@IDENTITY")
+        new_id = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, DateCreated, DateUpdated "
+            "FROM Assessment_Response WHERE Assessment_Response_ID = ?", new_id
+        )
+        row = cursor.fetchone()
+        return {
+            "Assessment_Response_ID": row.Assessment_Response_ID,
+            "Client_ID": row.Client_ID,
+            "Assessment_ID": row.Assessment_ID,
+            "Study_Question_ID": row.Study_Question_ID,
+            "Study_Answer_ID": row.Study_Answer_ID,
+            "Answer_Value": row.Answer_Value,
+            "DateCreated": row.DateCreated,
+            "DateUpdated": row.DateUpdated
+        }
+
+@app.get("/assessment-responses/", response_model=List[AssessmentResponse])
+def read_assessment_responses(
+    client_id: Optional[int] = Query(None, description="Filter by client ID"),
+    assessment_id: Optional[int] = Query(None, description="Filter by assessment ID"),
+    study_question_id: Optional[int] = Query(None, description="Filter by study question ID"),
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return")
+):
+    """Get all assessment responses with optional filtering and pagination"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        query = (
+            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, DateCreated, DateUpdated "
+            "FROM Assessment_Response WHERE 1=1"
+        )
+        params = []
+
+        if client_id is not None:
+            query += " AND Client_ID = ?"
+            params.append(client_id)
+
+        if assessment_id is not None:
+            query += " AND Assessment_ID = ?"
+            params.append(assessment_id)
+
+        if study_question_id is not None:
+            query += " AND Study_Question_ID = ?"
+            params.append(study_question_id)
+
+        query += " ORDER BY Assessment_Response_ID OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+        params.extend([skip, limit])
+
+        cursor.execute(query, *params)
+        rows = cursor.fetchall()
+        return [
+            {
+                "Assessment_Response_ID": row.Assessment_Response_ID,
+                "Client_ID": row.Client_ID,
+                "Assessment_ID": row.Assessment_ID,
+                "Study_Question_ID": row.Study_Question_ID,
+                "Study_Answer_ID": row.Study_Answer_ID,
+                "Answer_Value": row.Answer_Value,
+                "DateCreated": row.DateCreated,
+                "DateUpdated": row.DateUpdated
+            }
+            for row in rows
+        ]
+
+@app.get("/assessment-responses/{assessment_response_id}", response_model=AssessmentResponse)
+def read_assessment_response(assessment_response_id: int):
+    """Get a specific assessment response by ID"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, DateCreated, DateUpdated "
+            "FROM Assessment_Response WHERE Assessment_Response_ID = ?",
+            assessment_response_id
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Assessment response not found")
+        return {
+            "Assessment_Response_ID": row.Assessment_Response_ID,
+            "Client_ID": row.Client_ID,
+            "Assessment_ID": row.Assessment_ID,
+            "Study_Question_ID": row.Study_Question_ID,
+            "Study_Answer_ID": row.Study_Answer_ID,
+            "Answer_Value": row.Answer_Value,
+            "DateCreated": row.DateCreated,
+            "DateUpdated": row.DateUpdated
+        }
+
+@app.put("/assessment-responses/{assessment_response_id}", response_model=AssessmentResponse)
+def update_assessment_response(assessment_response_id: int, response: AssessmentResponseUpdate):
+    """Update an assessment response"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT Assessment_Response_ID FROM Assessment_Response WHERE Assessment_Response_ID = ?", assessment_response_id)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Assessment response not found")
+
+        data = response.model_dump(exclude_unset=True)
+
+        _validate_assessment_response_fks(cursor, data)
+
+        updates = ["DateUpdated = SYSUTCDATETIME()"]
+        params = []
+        for field, value in data.items():
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+        if params:
+            params.append(assessment_response_id)
+            cursor.execute(
+                f"UPDATE Assessment_Response SET {', '.join(updates)} WHERE Assessment_Response_ID = ?",
+                *params
+            )
+            conn.commit()
+
+        return read_assessment_response(assessment_response_id)
+
+@app.delete("/assessment-responses/{assessment_response_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_assessment_response(assessment_response_id: int):
+    """Delete an assessment response"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM Assessment_Response WHERE Assessment_Response_ID = ?", assessment_response_id)
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Assessment response not found")
         conn.commit()
