@@ -417,6 +417,7 @@ class StudyQuestion(StudyQuestionBase):
 # Study_Answers Models
 class StudyAnswerBase(BaseModel):
     Study_Question_ID: int
+    Study_Assessment_ID: int
     Answer_Text: str
     Answer_Value: Optional[int] = None
     Answer_Order: Optional[int] = None
@@ -426,6 +427,7 @@ class StudyAnswerCreate(StudyAnswerBase):
 
 class StudyAnswerUpdate(BaseModel):
     Study_Question_ID: Optional[int] = None
+    Study_Assessment_ID: Optional[int] = None
     Answer_Text: Optional[str] = None
     Answer_Value: Optional[int] = None
     Answer_Order: Optional[int] = None
@@ -2628,23 +2630,28 @@ def create_study_answer(study_answer: StudyAnswerCreate):
         if not cursor.fetchone():
             raise HTTPException(status_code=400, detail="Study question not found")
 
+        cursor.execute("SELECT Study_Assessment_ID FROM Study_Assessment WHERE Study_Assessment_ID = ?", study_answer.Study_Assessment_ID)
+        if not cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Study-assessment assignment not found")
+
         cursor.execute(
-            "INSERT INTO Study_Answers (Study_Question_ID, Answer_Text, Answer_Value, Answer_Order) "
-            "VALUES (?, ?, ?, ?)",
-            study_answer.Study_Question_ID, study_answer.Answer_Text,
+            "INSERT INTO Study_Answers (Study_Question_ID, Study_Assessment_ID, Answer_Text, Answer_Value, Answer_Order) "
+            "VALUES (?, ?, ?, ?, ?)",
+            study_answer.Study_Question_ID, study_answer.Study_Assessment_ID, study_answer.Answer_Text,
             study_answer.Answer_Value, study_answer.Answer_Order
         )
         conn.commit()
         cursor.execute("SELECT @@IDENTITY")
         new_id = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT Study_Answer_ID, Study_Question_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
+            "SELECT Study_Answer_ID, Study_Question_ID, Study_Assessment_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
             "FROM Study_Answers WHERE Study_Answer_ID = ?", new_id
         )
         row = cursor.fetchone()
         return {
             "Study_Answer_ID": row.Study_Answer_ID,
             "Study_Question_ID": row.Study_Question_ID,
+            "Study_Assessment_ID": row.Study_Assessment_ID,
             "Answer_Text": row.Answer_Text,
             "Answer_Value": row.Answer_Value,
             "Answer_Order": row.Answer_Order,
@@ -2655,6 +2662,7 @@ def create_study_answer(study_answer: StudyAnswerCreate):
 @app.get("/study-answers/", response_model=List[StudyAnswer])
 def read_study_answers(
     study_question_id: Optional[int] = Query(None, description="Filter by study question ID"),
+    study_assessment_id: Optional[int] = Query(None, description="Filter by study-assessment ID"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return")
 ):
@@ -2662,12 +2670,16 @@ def read_study_answers(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = "SELECT Study_Answer_ID, Study_Question_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated FROM Study_Answers WHERE 1=1"
+        query = "SELECT Study_Answer_ID, Study_Question_ID, Study_Assessment_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated FROM Study_Answers WHERE 1=1"
         params = []
 
         if study_question_id is not None:
             query += " AND Study_Question_ID = ?"
             params.append(study_question_id)
+
+        if study_assessment_id is not None:
+            query += " AND Study_Assessment_ID = ?"
+            params.append(study_assessment_id)
 
         query += " ORDER BY Answer_Order, Study_Answer_ID OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
         params.extend([skip, limit])
@@ -2678,6 +2690,7 @@ def read_study_answers(
             {
                 "Study_Answer_ID": row.Study_Answer_ID,
                 "Study_Question_ID": row.Study_Question_ID,
+                "Study_Assessment_ID": row.Study_Assessment_ID,
                 "Answer_Text": row.Answer_Text,
                 "Answer_Value": row.Answer_Value,
                 "Answer_Order": row.Answer_Order,
@@ -2693,7 +2706,7 @@ def read_study_answer(study_answer_id: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Study_Answer_ID, Study_Question_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
+            "SELECT Study_Answer_ID, Study_Question_ID, Study_Assessment_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
             "FROM Study_Answers WHERE Study_Answer_ID = ?",
             study_answer_id
         )
@@ -2703,6 +2716,7 @@ def read_study_answer(study_answer_id: int):
         return {
             "Study_Answer_ID": row.Study_Answer_ID,
             "Study_Question_ID": row.Study_Question_ID,
+            "Study_Assessment_ID": row.Study_Assessment_ID,
             "Answer_Text": row.Answer_Text,
             "Answer_Value": row.Answer_Value,
             "Answer_Order": row.Answer_Order,
@@ -2726,6 +2740,11 @@ def update_study_answer(study_answer_id: int, study_answer: StudyAnswerUpdate):
             cursor.execute("SELECT Study_Question_ID FROM Study_Questions WHERE Study_Question_ID = ?", data["Study_Question_ID"])
             if not cursor.fetchone():
                 raise HTTPException(status_code=400, detail="Study question not found")
+
+        if "Study_Assessment_ID" in data:
+            cursor.execute("SELECT Study_Assessment_ID FROM Study_Assessment WHERE Study_Assessment_ID = ?", data["Study_Assessment_ID"])
+            if not cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Study-assessment assignment not found")
 
         updates = ["DateUpdated = SYSUTCDATETIME()"]
         params = []
