@@ -327,6 +327,7 @@ class StudyBase(BaseModel):
     Active: Optional[bool] = True
     TherapistCount: Optional[int] = 0
     ClientCount: Optional[int] = 0
+    EndDate: Optional[date] = None
 
 class StudyCreate(StudyBase):
     pass
@@ -337,6 +338,7 @@ class StudyUpdate(BaseModel):
     Active: Optional[bool] = None
     TherapistCount: Optional[int] = None
     ClientCount: Optional[int] = None
+    EndDate: Optional[date] = None
 
 class Study(StudyBase):
     Id: int
@@ -350,8 +352,10 @@ class AssessmentBase(BaseModel):
     AssessmentCode: str
     AssessmentName: str
     Version: Optional[int] = Field(default=1, gt=0)
-    IntervalDays: int = Field(gt=0)
+    IntervalDays: Optional[int] = Field(default=None, gt=0)
     IsEnabled: Optional[bool] = True
+    StartDate: Optional[date] = None
+    EndDate: Optional[date] = None
 
 class AssessmentCreate(AssessmentBase):
     pass
@@ -362,6 +366,8 @@ class AssessmentUpdate(BaseModel):
     Version: Optional[int] = Field(default=None, gt=0)
     IntervalDays: Optional[int] = Field(default=None, gt=0)
     IsEnabled: Optional[bool] = None
+    StartDate: Optional[date] = None
+    EndDate: Optional[date] = None
 
 class Assessment(AssessmentBase):
     Id: int
@@ -2038,18 +2044,21 @@ def delete_safety_assessment(assessment_id: int):
 @app.post("/studies/", response_model=Study, status_code=status.HTTP_201_CREATED)
 def create_study(study: StudyCreate):
     """Create a new study"""
+    if study.EndDate is not None and study.EndDate < study.StartDate:
+        raise HTTPException(status_code=400, detail="EndDate must be on or after StartDate")
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO Study (Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate) "
-            "VALUES (?, ?, ?, ?, ?, GETDATE(), GETDATE())",
-            study.Name, study.StartDate, study.Active, study.TherapistCount, study.ClientCount
+            "INSERT INTO Study (Name, StartDate, Active, TherapistCount, ClientCount, EndDate, CreatedDate, UpdatedDate) "
+            "VALUES (?, ?, ?, ?, ?, ?, GETDATE(), GETDATE())",
+            study.Name, study.StartDate, study.Active, study.TherapistCount, study.ClientCount, study.EndDate
         )
         conn.commit()
         cursor.execute("SELECT @@IDENTITY")
         new_id = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate "
+            "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, EndDate, CreatedDate, UpdatedDate "
             "FROM Study WHERE Id = ?", new_id
         )
         row = cursor.fetchone()
@@ -2060,6 +2069,7 @@ def create_study(study: StudyCreate):
             "Active": row.Active,
             "TherapistCount": row.TherapistCount,
             "ClientCount": row.ClientCount,
+            "EndDate": row.EndDate,
             "CreatedDate": row.CreatedDate,
             "UpdatedDate": row.UpdatedDate
         }
@@ -2074,7 +2084,7 @@ def read_studies(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate FROM Study WHERE 1=1"
+        query = "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, EndDate, CreatedDate, UpdatedDate FROM Study WHERE 1=1"
         params = []
 
         if active is not None:
@@ -2094,6 +2104,7 @@ def read_studies(
                 "Active": row.Active,
                 "TherapistCount": row.TherapistCount,
                 "ClientCount": row.ClientCount,
+                "EndDate": row.EndDate,
                 "CreatedDate": row.CreatedDate,
                 "UpdatedDate": row.UpdatedDate
             }
@@ -2106,7 +2117,7 @@ def read_study(study_id: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, CreatedDate, UpdatedDate "
+            "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, EndDate, CreatedDate, UpdatedDate "
             "FROM Study WHERE Id = ?",
             study_id
         )
@@ -2120,6 +2131,7 @@ def read_study(study_id: int):
             "Active": row.Active,
             "TherapistCount": row.TherapistCount,
             "ClientCount": row.ClientCount,
+            "EndDate": row.EndDate,
             "CreatedDate": row.CreatedDate,
             "UpdatedDate": row.UpdatedDate
         }
@@ -2130,11 +2142,17 @@ def update_study(study_id: int, study: StudyUpdate):
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id FROM Study WHERE Id = ?", study_id)
-        if not cursor.fetchone():
+        cursor.execute("SELECT StartDate, EndDate FROM Study WHERE Id = ?", study_id)
+        existing = cursor.fetchone()
+        if not existing:
             raise HTTPException(status_code=404, detail="Study not found")
 
         data = study.model_dump(exclude_unset=True)
+
+        effective_start = data.get("StartDate", existing.StartDate)
+        effective_end = data.get("EndDate", existing.EndDate)
+        if effective_end is not None and effective_end < effective_start:
+            raise HTTPException(status_code=400, detail="EndDate must be on or after StartDate")
 
         updates = ["UpdatedDate = GETDATE()"]
         params = []
@@ -2164,17 +2182,29 @@ def delete_study(study_id: int):
 
 # ==================== ASSESSMENT CRUD ====================
 
+def _validate_assessment_schedule(interval_days: Optional[int], start_date: Optional[date], end_date: Optional[date]):
+    if interval_days is not None:
+        if start_date is not None or end_date is not None:
+            raise HTTPException(status_code=400, detail="IntervalDays cannot be combined with StartDate/EndDate")
+    elif start_date is None:
+        raise HTTPException(status_code=400, detail="Either IntervalDays or StartDate must be provided")
+
+    if start_date is not None and end_date is not None and end_date < start_date:
+        raise HTTPException(status_code=400, detail="EndDate must be on or after StartDate")
+
 @app.post("/assessments/", response_model=Assessment, status_code=status.HTTP_201_CREATED)
 def create_assessment(assessment: AssessmentCreate):
     """Create a new assessment"""
+    _validate_assessment_schedule(assessment.IntervalDays, assessment.StartDate, assessment.EndDate)
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
             cursor.execute(
-                "INSERT INTO Assessment (AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO Assessment (AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 assessment.AssessmentCode, assessment.AssessmentName, assessment.Version,
-                assessment.IntervalDays, assessment.IsEnabled
+                assessment.IntervalDays, assessment.IsEnabled, assessment.StartDate, assessment.EndDate
             )
             conn.commit()
         except pyodbc.IntegrityError:
@@ -2183,7 +2213,7 @@ def create_assessment(assessment: AssessmentCreate):
         cursor.execute("SELECT @@IDENTITY")
         new_id = cursor.fetchone()[0]
         cursor.execute(
-            "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, DateCreated, DateUpdated "
+            "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate, DateCreated, DateUpdated "
             "FROM Assessment WHERE Id = ?", new_id
         )
         row = cursor.fetchone()
@@ -2194,6 +2224,8 @@ def create_assessment(assessment: AssessmentCreate):
             "Version": row.Version,
             "IntervalDays": row.IntervalDays,
             "IsEnabled": row.IsEnabled,
+            "StartDate": row.StartDate,
+            "EndDate": row.EndDate,
             "DateCreated": row.DateCreated,
             "DateUpdated": row.DateUpdated
         }
@@ -2208,7 +2240,7 @@ def read_assessments(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, DateCreated, DateUpdated FROM Assessment WHERE 1=1"
+        query = "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate, DateCreated, DateUpdated FROM Assessment WHERE 1=1"
         params = []
 
         if is_enabled is not None:
@@ -2228,6 +2260,8 @@ def read_assessments(
                 "Version": row.Version,
                 "IntervalDays": row.IntervalDays,
                 "IsEnabled": row.IsEnabled,
+                "StartDate": row.StartDate,
+                "EndDate": row.EndDate,
                 "DateCreated": row.DateCreated,
                 "DateUpdated": row.DateUpdated
             }
@@ -2240,7 +2274,7 @@ def read_assessment(assessment_id: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, DateCreated, DateUpdated "
+            "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate, DateCreated, DateUpdated "
             "FROM Assessment WHERE Id = ?",
             assessment_id
         )
@@ -2254,6 +2288,8 @@ def read_assessment(assessment_id: int):
             "Version": row.Version,
             "IntervalDays": row.IntervalDays,
             "IsEnabled": row.IsEnabled,
+            "StartDate": row.StartDate,
+            "EndDate": row.EndDate,
             "DateCreated": row.DateCreated,
             "DateUpdated": row.DateUpdated
         }
@@ -2264,7 +2300,7 @@ def read_assessment_by_code(assessment_code: str):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, DateCreated, DateUpdated "
+            "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate, DateCreated, DateUpdated "
             "FROM Assessment WHERE AssessmentCode = ?",
             assessment_code
         )
@@ -2278,6 +2314,8 @@ def read_assessment_by_code(assessment_code: str):
             "Version": row.Version,
             "IntervalDays": row.IntervalDays,
             "IsEnabled": row.IsEnabled,
+            "StartDate": row.StartDate,
+            "EndDate": row.EndDate,
             "DateCreated": row.DateCreated,
             "DateUpdated": row.DateUpdated
         }
@@ -2288,11 +2326,17 @@ def update_assessment(assessment_id: int, assessment: AssessmentUpdate):
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id FROM Assessment WHERE Id = ?", assessment_id)
-        if not cursor.fetchone():
+        cursor.execute("SELECT IntervalDays, StartDate, EndDate FROM Assessment WHERE Id = ?", assessment_id)
+        existing = cursor.fetchone()
+        if not existing:
             raise HTTPException(status_code=404, detail="Assessment not found")
 
         data = assessment.model_dump(exclude_unset=True)
+
+        effective_interval_days = data.get("IntervalDays", existing.IntervalDays)
+        effective_start = data.get("StartDate", existing.StartDate)
+        effective_end = data.get("EndDate", existing.EndDate)
+        _validate_assessment_schedule(effective_interval_days, effective_start, effective_end)
 
         updates = ["DateUpdated = SYSUTCDATETIME()"]
         params = []
