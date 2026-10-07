@@ -58,6 +58,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==================== STUDY PAGES ====================
+# /study/* endpoints for annotate, adjudicate, coordinator and monitor pages.
+from study_router import router as study_router
+app.include_router(study_router)
+
 # ==================== DATABASE CONFIGURATION ====================
 # Azure: set AZURE_SQL_CONNECTION_STRING in App Service > Configuration > Application settings
 # Full ODBC connection string, e.g.:
