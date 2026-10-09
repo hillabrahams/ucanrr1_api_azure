@@ -17,7 +17,12 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="UCANRR1 API", version="2.0.0")
+# Interactive docs (/docs, /redoc, /openapi.json) are off unless ENABLE_DOCS=true.
+_docs = os.environ.get("ENABLE_DOCS", "").strip().lower() == "true"
+app = FastAPI(title="UCANRR1 API", version="2.0.0",
+              docs_url="/docs" if _docs else None,
+              redoc_url="/redoc" if _docs else None,
+              openapi_url="/openapi.json" if _docs else None)
 
 # ==================== FIREBASE INITIALIZATION ====================
 # Supports two methods:
@@ -41,6 +46,12 @@ else:
             "Firebase credentials not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON "
             "(JSON string) or FIREBASE_SERVICE_ACCOUNT_PATH (file path) environment variable."
         )
+
+# ==================== CALLER IDENTITY ====================
+# Installed before CORS so CORS stays the outermost middleware. AUTH_MODE
+# (off / report / enforce) is an App Service setting; see api_auth.py.
+from api_auth import install_auth
+install_auth(app)
 
 # ==================== CORS CONFIGURATION ====================
 
