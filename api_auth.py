@@ -82,10 +82,13 @@ def _verify_firebase(token: str) -> Optional[Dict[str, Any]]:
         claims = firebase_auth.verify_id_token(token)
     except Exception:
         return None
-    # The app's current custom-token sign-in uses the email as the uid, so
-    # fall back to it when the token carries no email claim.
-    email = claims.get("email") or (claims.get("uid") if "@" in str(claims.get("uid", "")) else None)
-    return {"kind": "firebase", "email": email, "exp": float(claims.get("exp", 0))} if email else None
+    # Only a verified email counts. Sessions made from /auth/firebase-token
+    # custom tokens carry no email claim (the uid is an unproven email), so
+    # they are rejected here and show up as auth=invalid until retired.
+    email = claims.get("email")
+    if not email or not claims.get("email_verified"):
+        return None
+    return {"kind": "firebase", "email": email, "exp": float(claims.get("exp", 0))}
 
 
 def _verify_google(token: str) -> Optional[Dict[str, Any]]:

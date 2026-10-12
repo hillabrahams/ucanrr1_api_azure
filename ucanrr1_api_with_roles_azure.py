@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status, Query
+from fastapi import FastAPI, HTTPException, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import Optional, List
@@ -689,6 +689,63 @@ def get_firebase_token(request: FirebaseTokenRequest):
             "RoleName": row.RoleName,
             "RedirectURL": row.RedirectURL,
         }
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    """
+    Who the signed-in caller is, from their verified token (see api_auth.py):
+    the AuthorizedUsers row, their informed-consent flag, and, for a client,
+    their own couple record. Replaces /auth/firebase-token for the app, which
+    trusted an email without proof, and the app's download of the client list.
+    """
+    email = getattr(request.state, "auth_email", None)
+    if not email:
+        raise HTTPException(status_code=401, detail="Please sign in.")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT au.UserID, au.Email, au.FullName, au.IsActive, au.RoleID, au.HasInformedConsent, "
+            "       r.RoleName, r.RedirectURL "
+            "FROM AuthorizedUsers au LEFT JOIN Roles r ON au.RoleID = r.RoleID "
+            "WHERE LOWER(au.Email) = ?",
+            email,
+        )
+        user = cursor.fetchone()
+        if not user:
+            raise HTTPException(status_code=403, detail="Your account is not authorized. Please contact your therapist.")
+        if not user.IsActive:
+            raise HTTPException(status_code=403, detail="Account is inactive")
+
+        # A couple's usernames are nchar, so trim before comparing.
+        cursor.execute(
+            "SELECT TOP 1 Id, TherapistID, "
+            "       CASE WHEN LOWER(LTRIM(RTRIM(Client1UserName))) = ? THEN 1 ELSE 0 END AS IsClient1 "
+            "FROM Client "
+            "WHERE LOWER(LTRIM(RTRIM(Client1UserName))) = ? OR LOWER(LTRIM(RTRIM(Client2UserName))) = ? "
+            "ORDER BY Id",
+            email, email, email,
+        )
+        client = cursor.fetchone()
+
+        cursor.execute("UPDATE AuthorizedUsers SET LastLogin = GETDATE() WHERE UserID = ?", user.UserID)
+        conn.commit()
+
+    return {
+        "UserID": user.UserID,
+        "Email": user.Email,
+        "FullName": user.FullName,
+        "RoleID": user.RoleID,
+        "RoleName": user.RoleName,
+        "RedirectURL": user.RedirectURL,
+        "HasInformedConsent": bool(user.HasInformedConsent),
+        "Client": None if not client else {
+            "Id": client.Id,
+            "IsClient1": bool(client.IsClient1),
+            "IsClient2": not bool(client.IsClient1),
+            "TherapistID": client.TherapistID,
+        },
+    }
 
 # ==================== ROLES CRUD ====================
 
