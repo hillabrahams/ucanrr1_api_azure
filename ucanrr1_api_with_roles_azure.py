@@ -1458,6 +1458,18 @@ def read_client(client_id: int):
             "UpdatedDate": row.UpdatedDate
         }
 
+@app.get("/clients/{client_id}/study-status")
+def read_client_study_status(client_id: int):
+    """Whether the couple is in the feasibility study, and since when. The
+    dashboard uses it to say that study-period safety flags go to the
+    escalation clinician (protocol §8.2) instead of showing them."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT Study_Start_At FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
+        row = cursor.fetchone()
+    return {"clientId": client_id, "inStudy": row is not None,
+            "studyStartAt": row.Study_Start_At if row else None}
+
 @app.put("/clients/{client_id}", response_model=Client)
 def update_client(client_id: int, client: ClientUpdate):
     """Update a client"""
@@ -2009,6 +2021,26 @@ def create_safety_assessment(assessment: SafetyAssessmentCreate):
         cursor.execute(f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE Id = ?", new_id)
         return _sa_row(cursor.fetchone())
 
+# Protocol §8.2, B4 §5: a study couple's safety flags go to the study's
+# escalation clinician (study.usp_Get_Escalation_Queue) and never to the
+# therapist dashboard. Assessments made from the couple's first research
+# consent on are left out of every read here; earlier ones stay visible.
+# dbo.vw_Study_Couple comes from sql/study_patch_2026-10-17b_escalation.sql.
+_SA_NOT_STUDY_PERIOD = """NOT EXISTS (SELECT 1 FROM dbo.vw_Study_Couple sc
+    WHERE sc.ClientId = SafetyAssessment.ClientId AND SafetyAssessment.AssessedAt >= sc.Study_Start_At)"""
+
+def _get_safety_assessment(assessment_id: int, include_study_period: bool):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        query = f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE Id = ?"
+        if not include_study_period:
+            query += f" AND {_SA_NOT_STUDY_PERIOD}"
+        cursor.execute(query, assessment_id)
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Safety assessment not found")
+        return _sa_row(row)
+
 @app.get("/safety-assessments/", response_model=List[SafetyAssessmentModel])
 def read_safety_assessments(
     client_id: Optional[int] = Query(None),
@@ -2021,7 +2053,7 @@ def read_safety_assessments(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE 1=1"
+        query = f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE {_SA_NOT_STUDY_PERIOD}"
         params = []
 
         if client_id is not None:
@@ -2042,14 +2074,8 @@ def read_safety_assessments(
 
 @app.get("/safety-assessments/{assessment_id}", response_model=SafetyAssessmentModel)
 def read_safety_assessment(assessment_id: int):
-    """Get a specific safety assessment by ID"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE Id = ?", assessment_id)
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Safety assessment not found")
-        return _sa_row(row)
+    """Get a specific safety assessment by ID (not a study couple's, from the study period)"""
+    return _get_safety_assessment(assessment_id, include_study_period=False)
 
 @app.put("/safety-assessments/{assessment_id}", response_model=SafetyAssessmentModel)
 def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpdate):
@@ -2078,7 +2104,9 @@ def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpd
             )
             conn.commit()
 
-        return read_safety_assessment(assessment_id)
+        # The app links the event after creating the assessment, so it gets the
+        # record back even for a study couple.
+        return _get_safety_assessment(assessment_id, include_study_period=True)
 
 @app.put("/safety-assessments/{assessment_id}/acknowledge", response_model=SafetyAssessmentModel)
 def acknowledge_safety_assessment(assessment_id: int, body: SafetyAssessmentAcknowledge):
@@ -2086,7 +2114,8 @@ def acknowledge_safety_assessment(assessment_id: int, body: SafetyAssessmentAckn
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        # A study couple's flags are reviewed by the escalation clinician, not here.
+        cursor.execute(f"SELECT Id FROM SafetyAssessment WHERE Id = ? AND {_SA_NOT_STUDY_PERIOD}", assessment_id)
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Safety assessment not found")
 

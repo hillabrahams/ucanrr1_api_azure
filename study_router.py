@@ -82,7 +82,10 @@ ANNOTATOR_ROLES: Dict[str, str] = {
 }
 COORDINATOR_ROLES = {"Study Coordinator"}
 MONITOR_ROLES = {"Study Coordinator"}  # RCT-RESERVED: also "Study Monitor"
-STUDY_ROLES = set(ANNOTATOR_ROLES) | COORDINATOR_ROLES | MONITOR_ROLES
+# Protocol §8.2, B4 §5: tier 3 safety flags from study couples go to an
+# escalation clinician independent of the study, never to the dashboard.
+ESCALATION_ROLES = {"Study Escalation Clinician"}
+STUDY_ROLES = set(ANNOTATOR_ROLES) | COORDINATOR_ROLES | MONITOR_ROLES | ESCALATION_ROLES
 
 FLAGS = ("IsNeglect", "IsRepair", "IsBid", "IsCare", "IsShared")
 
@@ -135,7 +138,7 @@ _SQL_ERR = re.compile(r"\((\d{3,6})\)\s*\(SQL")
 _HTTP_FOR_SQL = {
     51001: 403, 51002: 404, 51003: 400, 51004: 400, 51005: 403,
     51006: 409, 51007: 400, 51008: 403,
-    51021: 409, 51022: 409, 51023: 409, 51024: 400, 51025: 409, 51026: 400, 51027: 400,
+    51021: 409, 51022: 409, 51023: 409, 51024: 400, 51025: 409, 51026: 400, 51027: 400, 51028: 409,
     2601: 409, 2627: 409, 547: 400,
 }
 
@@ -342,6 +345,20 @@ def monitor_session(p: Principal = Depends(get_principal)) -> Iterator[StaffSess
     yield from _staff_session(p, MONITOR_ROLES)
 
 
+def escalation_session(p: Principal = Depends(get_principal)) -> Iterator[StaffSession]:
+    # The escalation procedures run on the app connection (study_app), which
+    # can execute them but can't read study tables directly.
+    if p.role not in ESCALATION_ROLES:
+        raise HTTPException(403, "This page is for the study's escalation clinician.")
+    conn = _connect(STUDY_APP_CS, "STUDY_APP_CONNECTION_STRING")
+    try:
+        with _sql():
+            _set_ctx(conn.cursor(), "actor_user_id", str(p.user_id))
+        yield StaffSession(conn, p)
+    finally:
+        conn.close()
+
+
 def _closed_at(cur: pyodbc.Cursor) -> Optional[str]:
     cur.execute("EXEC study.usp_Get_Study_Status")
     rows = _rows(cur)
@@ -474,6 +491,38 @@ def save_gold(entry_id: int, body: LabelIn, s: AnnotatorSession = Depends(adjudi
             "@IsBid=?, @IsCare=?, @IsShared=?, @Sentiment=?, @Safety_Tier=?",
             entry_id, method, *(int(getattr(body, f)) for f in FLAGS), body.Sentiment, body.Safety_Tier)
     return {"method": method}
+
+
+# ----------------------------------------------------------------------------
+# Escalation (Study Escalation Clinician), protocol §8.2
+# ----------------------------------------------------------------------------
+
+@router.get("/escalations")
+def escalation_queue(include_reviewed: bool = False, s: StaffSession = Depends(escalation_session)):
+    # Tier 3 flags of study couples from the study period: flags and the
+    # model's explanation, never entry text. Opening the queue records the
+    # first view of each flag.
+    with _sql():
+        cur = s.cursor()
+        cur.execute("EXEC study.usp_Get_Escalation_Queue @Include_Reviewed = ?", int(include_reviewed))
+        rows = _rows(cur)
+    for r in rows:
+        r["TherapistUserName"] = _strip(r.get("TherapistUserName"))
+    return rows
+
+
+class EscalationReviewIn(BaseModel):
+    Note: Optional[str] = Field(default=None, max_length=1000)
+
+
+@router.post("/escalations/{assessment_id}/review")
+def escalation_review(assessment_id: int, body: EscalationReviewIn, s: StaffSession = Depends(escalation_session)):
+    with _sql():
+        cur = s.cursor()
+        cur.execute("EXEC study.usp_Mark_Escalation_Reviewed @Safety_Assessment_ID = ?, @Note = ?",
+                    assessment_id, body.Note)
+        rows = _rows(cur)
+    return {"reviewedAt": rows[0]["Reviewed_At"] if rows else None}
 
 
 # ----------------------------------------------------------------------------
@@ -876,6 +925,10 @@ def monitor_summary(days: int = Query(30, ge=1, le=365), s: StaffSession = Depen
             "AND (Entries_Viewed > 0 OR Annotations_Saved > 0 OR Denied_Events > 0) "
             "ORDER BY Event_Date DESC, Denied_Events DESC", days)
         audit = _rows(cur)
+        # Safety record (M6): tier 3 flags of study couples and time to review.
+        cur.execute("SELECT AssessedAt, First_Viewed_At, Reviewed_At, Minutes_To_Review "
+                    "FROM study.vw_Escalation_Record")
+        flags = _rows(cur)
         names = {str(u["UserID"]): (u["FullName"] or u["Email"]) for u in _study_users()}
     for a in audit:
         a["Actor_Name"] = names.get(str(a["Actor_User_ID"])) if a["Actor_User_ID"] else None
@@ -890,5 +943,14 @@ def monitor_summary(days: int = Query(30, ge=1, le=365), s: StaffSession = Depen
     }
     for k in ("Entries", "Restricted_Entries", "Rateable_Entries", "Labeled_Once", "Labeled_Twice", "Gold_Final"):
         totals[k[0].lower() + k[1:].replace("_", "")] = sum(int(p[k]) for p in progress)
+    minutes = sorted(int(f["Minutes_To_Review"]) for f in flags if f["Minutes_To_Review"] is not None)
+    escalations = {
+        "flags": len(flags),
+        "reviewed": len(minutes),
+        "notYetOpened": sum(1 for f in flags if not f["First_Viewed_At"]),
+        "medianMinutesToReview": minutes[len(minutes) // 2] if minutes else None,
+        "maxMinutesToReview": minutes[-1] if minutes else None,
+    }
     return {"studyClosedAt": closed, "totals": totals, "progress": progress,
-            "agreement": agreement_stats(pairs), "audit": audit, "auditDays": days}
+            "agreement": agreement_stats(pairs), "escalations": escalations,
+            "audit": audit, "auditDays": days}
