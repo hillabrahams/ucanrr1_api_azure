@@ -66,7 +66,8 @@ INSERT @s EXEC study.usp_Ingest_Entry N'41-1', N'T-E3', '2026-09-18T20:00:00', N
 INSERT @s EXEC study.usp_Ingest_Entry N'41-2', N'T-E4', '2026-09-18T21:00:00', N'RAW four', 1;
 INSERT @s EXEC study.usp_Ingest_Entry N'42-1', N'T-E5', '2026-09-19T20:00:00', N'RAW five', 1;
 REVERT;
-DECLARE @ok BIT = CASE WHEN (SELECT COUNT(*) FROM @s WHERE s = 'INGESTED') = 5 THEN 1 ELSE 0 END;
+-- From the 10-20 patch on, entries without B3 permission are ingested without text.
+DECLARE @ok BIT = CASE WHEN (SELECT COUNT(*) FROM @s WHERE s IN ('INGESTED', 'INGESTED_NO_TEXT')) = 5 THEN 1 ELSE 0 END;
 EXEC dbo.t_check N'00 setup: five entries ingested', @ok;
 GO
 
