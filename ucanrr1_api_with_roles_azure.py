@@ -1141,14 +1141,16 @@ def read_authorized_user_with_role(user_id: int):
             "HasInformedConsent": row[9]
         }
 
-@app.get("/authorized-users/email/{email}", response_model=AuthorizedUser)
+@app.get("/authorized-users/email/{email}", response_model=AuthorizedUserWithRole)
 def read_authorized_user_by_email(email: str):
-    """Get a specific authorized user by email"""
+    """Get a specific authorized user by email, with their role's name and
+    RedirectURL (default.html sends study roles to that page after login)"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent "
-            "FROM AuthorizedUsers WHERE Email = ?",
+            "SELECT au.UserID, au.Email, au.FullName, au.IsActive, au.CreatedAt, au.LastLogin, au.RoleID, "
+            "       au.HasInformedConsent, r.RoleName, r.RedirectURL "
+            "FROM AuthorizedUsers au LEFT JOIN Roles r ON r.RoleID = au.RoleID WHERE au.Email = ?",
             email
         )
         row = cursor.fetchone()
@@ -1162,6 +1164,8 @@ def read_authorized_user_by_email(email: str):
             "CreatedAt": row.CreatedAt,
             "LastLogin": row.LastLogin,
             "RoleID": row.RoleID,
+            "RoleName": row.RoleName.strip() if row.RoleName else None,
+            "RedirectURL": row.RedirectURL.strip() if row.RedirectURL else None,
             "HasInformedConsent": row.HasInformedConsent
         }
 
