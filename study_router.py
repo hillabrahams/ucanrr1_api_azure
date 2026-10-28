@@ -139,6 +139,7 @@ _HTTP_FOR_SQL = {
     51001: 403, 51002: 404, 51003: 400, 51004: 400, 51005: 403,
     51006: 409, 51007: 400, 51008: 403,
     51021: 409, 51022: 409, 51023: 409, 51024: 400, 51025: 409, 51026: 400, 51027: 400, 51028: 409,
+    51030: 400, 51031: 400, 51032: 409,
     2601: 409, 2627: 409, 547: 400,
 }
 
@@ -570,7 +571,7 @@ def coord_overview(s: StaffSession = Depends(coordinator_session)):
         annotators = _rows(cur)
         cur.execute(
             "SELECT sp.Study_Participant_ID, pl.Source_Client_ID, sp.Consent_Version, sp.Research_Consent_At, "
-            "sp.Screening_Instrument, sp.Partner_Consent_Status, sp.Research_Paused_At, sp.Pause_Reason, "
+            "sp.Couple_ID, sp.Clinician_Attestation_Date, sp.Research_Paused_At, sp.Pause_Reason, "
             "sp.Withdrawn_At, sp.Created_At, sp.Text_Retention_At, sp.Text_Retention_Version, "
             "ISNULL(p.Entries,0) AS Entries, ISNULL(p.Restricted_Entries,0) AS Restricted_Entries, "
             "ISNULL(p.Rateable_Entries,0) AS Rateable_Entries, ISNULL(p.Labeled_Once,0) AS Labeled_Once, "
@@ -578,7 +579,7 @@ def coord_overview(s: StaffSession = Depends(coordinator_session)):
             "FROM study.Study_Participant sp "
             "LEFT JOIN study.Participant_Link pl ON pl.Study_Participant_ID = sp.Study_Participant_ID "
             "LEFT JOIN study.vw_Annotation_Progress p ON p.Study_Participant_ID = sp.Study_Participant_ID "
-            "ORDER BY sp.Study_Participant_ID")
+            "ORDER BY sp.Couple_ID, sp.Study_Participant_ID")
         participants = _rows(cur)
         cur.execute(
             "SELECT Assignment_ID, Annotator_ID, Study_Participant_ID, Assigned_At "
@@ -660,29 +661,32 @@ def coord_register_annotator(body: AnnotatorIn, s: StaffSession = Depends(coordi
         return _rows(cur)[0]
 
 
-class EnrollIn(BaseModel):
+class CoupleEnrollIn(BaseModel):
+    # Protocol §4.3, B2 §1: both partners consent or the couple does not enroll.
     Client_ID: int
-    Partner: Literal[1, 2]
     Consent_Version: str = Field(min_length=1, max_length=20)
-    Research_Consent_At: datetime
-    Screening_Instrument: str = Field(min_length=1, max_length=50)
-    Screening_Passed_At: datetime
-    Partner_Consent_Status: Literal["BOTH_CONSENTED", "SINGLE"]
-    # B3 permission to keep this partner's text, de-identified. Optional at
-    # enrollment; it can also be recorded later.
-    Text_Retention_At: Optional[datetime] = None
-    Text_Retention_Version: Optional[str] = Field(default=None, min_length=1, max_length=20)
+    Partner1_Consent_At: datetime
+    Partner2_Consent_At: datetime
+    # §4.4, B4 §3: eligibility is the clinician's judgment; only the date the
+    # attestation was received is kept, no instrument or score.
+    Clinician_Attestation_Date: date
+    # B3 permission to keep each partner's text, de-identified. Each partner
+    # decides for themselves; optional at enrollment, can be recorded later.
+    Partner1_Text_Retention_At: Optional[datetime] = None
+    Partner1_Text_Retention_Version: Optional[str] = Field(default=None, min_length=1, max_length=20)
+    Partner2_Text_Retention_At: Optional[datetime] = None
+    Partner2_Text_Retention_Version: Optional[str] = Field(default=None, min_length=1, max_length=20)
     # RCT-RESERVED: assign the client's therapist as a treating-therapist annotator
     # Assign_Treating_Therapist: bool = True
 
 
-@router.post("/coord/participants")
-def coord_enroll(body: EnrollIn, s: StaffSession = Depends(coordinator_session)):
-    if (body.Text_Retention_At is None) != (body.Text_Retention_Version is None):
-        raise HTTPException(400, "Give both the B3 signing time and the B3 form version, or neither.")
-    # One participant per consenting person: "<Client.Id>-<partner>", so a
-    # SINGLE consent never pulls in the other partner's entries.
-    source_client_id = f"{body.Client_ID}-{body.Partner}"
+@router.post("/coord/couples")
+def coord_enroll_couple(body: CoupleEnrollIn, s: StaffSession = Depends(coordinator_session)):
+    b3 = [(body.Partner1_Text_Retention_At, body.Partner1_Text_Retention_Version),
+          (body.Partner2_Text_Retention_At, body.Partner2_Text_Retention_Version)]
+    for n, (at, ver) in enumerate(b3, 1):
+        if (at is None) != (ver is None):
+            raise HTTPException(400, f"Partner {n}: give both the B3 signing time and the B3 form version, or neither.")
     with _sql():
         clients = _main_rows(
             "SELECT c.Id, t.TherapistUserName FROM Client c LEFT JOIN Therapist t ON t.Id = c.TherapistID "
@@ -692,14 +696,16 @@ def coord_enroll(body: EnrollIn, s: StaffSession = Depends(coordinator_session))
     with _sql():
         cur = s.cursor()
         cur.execute(
-            "EXEC study.usp_Enroll_Participant @Source_Client_ID=?, @Consent_Version=?, @Research_Consent_At=?, "
-            "@Screening_Instrument=?, @Screening_Passed_At=?, @Partner_Consent_Status=?",
-            source_client_id, body.Consent_Version, _utc_naive(body.Research_Consent_At),
-            body.Screening_Instrument, _utc_naive(body.Screening_Passed_At), body.Partner_Consent_Status)
-        pid = int(_rows(cur)[0]["Study_Participant_ID"])
-        if body.Text_Retention_At is not None:
-            cur.execute("EXEC study.usp_Record_Text_Retention @Study_Participant_ID=?, @Authorized_At=?, @Version=?",
-                        pid, _utc_naive(body.Text_Retention_At), body.Text_Retention_Version)
+            "EXEC study.usp_Enroll_Couple @Client_ID=?, @Consent_Version=?, @Partner1_Consent_At=?, "
+            "@Partner2_Consent_At=?, @Clinician_Attestation_Date=?",
+            body.Client_ID, body.Consent_Version, _utc_naive(body.Partner1_Consent_At),
+            _utc_naive(body.Partner2_Consent_At), body.Clinician_Attestation_Date)
+        r = _rows(cur)[0]
+        pids = [int(r["Partner1_Participant_ID"]), int(r["Partner2_Participant_ID"])]
+        for pid, (at, ver) in zip(pids, b3):
+            if at is not None:
+                cur.execute("EXEC study.usp_Record_Text_Retention @Study_Participant_ID=?, @Authorized_At=?, @Version=?",
+                            pid, _utc_naive(at), ver)
 
         # RCT-RESERVED: assign the client's therapist as a treating-therapist annotator
         # assigned_annotator = None
@@ -718,10 +724,11 @@ def coord_enroll(body: EnrollIn, s: StaffSession = Depends(coordinator_session))
         #             note = "The client's therapist isn't registered as a study annotator yet, so no one was assigned."
         #         else:
         #             assigned_annotator = int(hit[0]["Annotator_ID"])
-        #             cur.execute("EXEC study.usp_Assign_Annotator @Annotator_ID=?, @Study_Participant_ID=?",
-        #                         assigned_annotator, pid)
+        #             for pid in pids:
+        #                 cur.execute("EXEC study.usp_Assign_Annotator @Annotator_ID=?, @Study_Participant_ID=?",
+        #                             assigned_annotator, pid)
     # RCT-RESERVED: also return "assignedAnnotatorId": assigned_annotator, "note": note
-    return {"Study_Participant_ID": pid, "Source_Client_ID": source_client_id}
+    return {"Couple_ID": int(r["Couple_ID"]), "Partner1_Participant_ID": pids[0], "Partner2_Participant_ID": pids[1]}
 
 
 class TextRetentionIn(BaseModel):
@@ -907,7 +914,7 @@ def monitor_summary(days: int = Query(30, ge=1, le=365), s: StaffSession = Depen
         cur = s.cursor()
         closed = _closed_at(cur)
         cur.execute(
-            "SELECT sp.Study_Participant_ID, sp.Partner_Consent_Status, sp.Research_Paused_At, sp.Withdrawn_At, "
+            "SELECT sp.Study_Participant_ID, sp.Couple_ID, sp.Research_Paused_At, sp.Withdrawn_At, "
             "sp.Created_At, sp.Text_Retention_At, ISNULL(p.Entries,0) AS Entries, "
             "ISNULL(p.Restricted_Entries,0) AS Restricted_Entries, ISNULL(p.Rateable_Entries,0) AS Rateable_Entries, "
             "ISNULL(p.Labeled_Once,0) AS Labeled_Once, ISNULL(p.Labeled_Twice,0) AS Labeled_Twice, "
