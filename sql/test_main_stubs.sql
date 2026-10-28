@@ -20,7 +20,7 @@ IF OBJECT_ID(N'dbo.SafetyAssessment', N'U') IS NULL
     CREATE TABLE dbo.SafetyAssessment (
         Id INT IDENTITY(1,1) PRIMARY KEY, EventId INT NULL, ClientId INT NOT NULL,
         IsClient1 BIT NOT NULL DEFAULT 0, IsClient2 BIT NOT NULL DEFAULT 0,
-        RiskTier INT NOT NULL, RiskLabel NVARCHAR(100) NOT NULL,
+        RiskTier INT NOT NULL CHECK (RiskTier BETWEEN 0 AND 3), RiskLabel NVARCHAR(100) NOT NULL,  -- as in production before 2026-10-28
         HasSuicidalIdeation BIT NOT NULL DEFAULT 0, HasSelfHarm BIT NOT NULL DEFAULT 0,
         HasOtherHarm BIT NOT NULL DEFAULT 0, HasExtremeAbuse BIT NOT NULL DEFAULT 0,
         HasHeatedArgument BIT NOT NULL DEFAULT 0, HasCrisisLanguage BIT NOT NULL DEFAULT 0,

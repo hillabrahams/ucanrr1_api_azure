@@ -23,6 +23,20 @@ SET XACT_ABORT ON;
 GO
 
 /* ---------------------------------------------------------------------
+   0. dbo.SafetyAssessment has a CHECK constraint on RiskTier for the old
+      0–3 scale (system-named, e.g. CK__SafetyAss__RiskT__31B762FC). Drop
+      every CHECK constraint on that column; a 1–5 one is added in step 1b.
+   --------------------------------------------------------------------- */
+DECLARE @drop NVARCHAR(MAX) = N'';
+SELECT @drop = @drop + N'ALTER TABLE dbo.SafetyAssessment DROP CONSTRAINT ' + QUOTENAME(cc.name) + N';'
+FROM sys.check_constraints cc
+JOIN sys.columns c ON c.object_id = cc.parent_object_id AND c.column_id = cc.parent_column_id
+WHERE cc.parent_object_id = OBJECT_ID(N'dbo.SafetyAssessment') AND c.name = N'RiskTier'
+  AND cc.name <> N'CK_SafetyAssessment_RiskTier_1to5';
+EXEC sys.sp_executesql @drop;
+GO
+
+/* ---------------------------------------------------------------------
    1. Convert existing safety assessments by label (idempotent).
    --------------------------------------------------------------------- */
 UPDATE dbo.SafetyAssessment
@@ -43,6 +57,22 @@ UPDATE dbo.SafetyAssessment
                     WHEN N'extreme_abuse'     THEN 5
                     WHEN N'phq9_item9'        THEN 4
                   END;
+GO
+
+/* ---------------------------------------------------------------------
+   1b. The five-tier range for new rows. Checked against existing rows
+       when they all fit; otherwise (a row with an unknown label still
+       below 1) it applies to new and changed rows only.
+   --------------------------------------------------------------------- */
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_SafetyAssessment_RiskTier_1to5')
+BEGIN
+    IF EXISTS (SELECT 1 FROM dbo.SafetyAssessment WHERE RiskTier NOT BETWEEN 1 AND 5)
+        ALTER TABLE dbo.SafetyAssessment WITH NOCHECK
+            ADD CONSTRAINT CK_SafetyAssessment_RiskTier_1to5 CHECK (RiskTier BETWEEN 1 AND 5);
+    ELSE
+        ALTER TABLE dbo.SafetyAssessment WITH CHECK
+            ADD CONSTRAINT CK_SafetyAssessment_RiskTier_1to5 CHECK (RiskTier BETWEEN 1 AND 5);
+END;
 GO
 
 /* ---------------------------------------------------------------------
@@ -145,7 +175,15 @@ WHERE sa.RiskTier >= 4 OR LOWER(LTRIM(RTRIM(sa.RiskLabel))) IN (N'crisis', N'ext
 GO
 
 /* Check: every row should say ok. */
-SELECT 'SafetyAssessment rows on the five-tier scale' AS name,
+SELECT 'RiskTier allows 1-5 only' AS name,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = N'CK_SafetyAssessment_RiskTier_1to5')
+             AND NOT EXISTS (SELECT 1 FROM sys.check_constraints cc
+                             JOIN sys.columns c ON c.object_id = cc.parent_object_id AND c.column_id = cc.parent_column_id
+                             WHERE cc.parent_object_id = OBJECT_ID(N'dbo.SafetyAssessment') AND c.name = N'RiskTier'
+                               AND cc.name <> N'CK_SafetyAssessment_RiskTier_1to5')
+            THEN 'ok' ELSE 'MISSING' END AS status
+UNION ALL
+SELECT 'SafetyAssessment rows on the five-tier scale',
        CASE WHEN NOT EXISTS (
             SELECT 1 FROM dbo.SafetyAssessment
             WHERE (LOWER(LTRIM(RTRIM(RiskLabel))) = N'normal' AND RiskTier <> 1)
