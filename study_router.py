@@ -82,7 +82,7 @@ ANNOTATOR_ROLES: Dict[str, str] = {
 }
 COORDINATOR_ROLES = {"Study Coordinator"}
 MONITOR_ROLES = {"Study Coordinator"}  # RCT-RESERVED: also "Study Monitor"
-# Protocol §8.2, B4 §5: tier 3 safety flags from study couples go to an
+# Protocol §8.2, B4 §5: Crisis and Extreme Abuse (tier 4–5) safety flags from study couples go to an
 # escalation clinician independent of the study, never to the dashboard.
 ESCALATION_ROLES = {"Study Escalation Clinician"}
 STUDY_ROLES = set(ANNOTATOR_ROLES) | COORDINATOR_ROLES | MONITOR_ROLES | ESCALATION_ROLES
@@ -499,7 +499,7 @@ def save_gold(entry_id: int, body: LabelIn, s: AnnotatorSession = Depends(adjudi
 
 @router.get("/escalations")
 def escalation_queue(include_reviewed: bool = False, s: StaffSession = Depends(escalation_session)):
-    # Tier 3 flags of study couples from the study period: flags and the
+    # Crisis and Extreme Abuse (tier 4–5) flags of study couples from the study period: flags and the
     # model's explanation, never entry text. Opening the queue records the
     # first view of each flag.
     with _sql():
@@ -925,7 +925,7 @@ def monitor_summary(days: int = Query(30, ge=1, le=365), s: StaffSession = Depen
             "AND (Entries_Viewed > 0 OR Annotations_Saved > 0 OR Denied_Events > 0) "
             "ORDER BY Event_Date DESC, Denied_Events DESC", days)
         audit = _rows(cur)
-        # Safety record (M6): tier 3 flags of study couples and time to review.
+        # Safety record (M6): tier 4–5 flags of study couples and time to review.
         cur.execute("SELECT AssessedAt, First_Viewed_At, Reviewed_At, Minutes_To_Review "
                     "FROM study.vw_Escalation_Record")
         flags = _rows(cur)

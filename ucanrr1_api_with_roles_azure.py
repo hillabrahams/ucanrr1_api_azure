@@ -1951,6 +1951,20 @@ _SA_COLUMNS = """
     Explanation, ApiVersion, TherapistAcknowledgedAt, TherapistAcknowledgedById, AssessedAt
 """
 
+# Protocol §8.1: one safety tier set. Stored tiers are 1 Normal, 2 Heated,
+# 3 Ambiguous Monitor, 4 Crisis, 5 Extreme Abuse. The safety service answers
+# 0–3 (it ranks ambiguous monitor below heated and puts crisis and extreme
+# abuse both at 3), and app builds before 2026-10-28 send that number as is,
+# so the tier is taken from the label whenever the label is known. The same
+# labels convert existing rows in sql/study_patch_2026-10-28_five_tier.sql.
+_FIVE_TIER_BY_LABEL = {
+    "normal": 1, "heated": 2, "ambiguous_monitor": 3,
+    "crisis": 4, "extreme_abuse": 5, "phq9_item9": 4,
+}
+
+def _five_tier(risk_tier: Optional[int], risk_label: Optional[str]) -> Optional[int]:
+    return _FIVE_TIER_BY_LABEL.get((risk_label or "").strip().lower(), risk_tier)
+
 def _sa_row(row):
     return {
         "Id": row.Id, "EventId": row.EventId, "ClientId": row.ClientId,
@@ -2008,7 +2022,8 @@ def create_safety_assessment(assessment: SafetyAssessmentCreate):
                 Explanation, ApiVersion
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            assessment.EventId, assessment.ClientId, assessment.IsClient1, assessment.IsClient2, assessment.RiskTier, assessment.RiskLabel,
+            assessment.EventId, assessment.ClientId, assessment.IsClient1, assessment.IsClient2,
+            _five_tier(assessment.RiskTier, assessment.RiskLabel), assessment.RiskLabel,
             assessment.HasSuicidalIdeation, assessment.HasSelfHarm, assessment.HasOtherHarm, assessment.HasExtremeAbuse,
             assessment.HasHeatedArgument, assessment.HasCrisisLanguage, assessment.MentionsSubstanceUse,
             assessment.MentionsWeaponAccess, assessment.MentionsChildSafetyConcern, assessment.AmbiguousLethalCuriosity,
@@ -2087,11 +2102,19 @@ def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpd
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id FROM SafetyAssessment WHERE Id = ?", assessment_id)
-        if not cursor.fetchone():
+        cursor.execute("SELECT Id, RiskLabel FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        current = cursor.fetchone()
+        if not current:
             raise HTTPException(status_code=404, detail="Safety assessment not found")
 
         data = assessment.model_dump(exclude_unset=True)
+
+        # Keep the stored tier on the five-tier scale (see _five_tier).
+        if "RiskTier" in data or "RiskLabel" in data:
+            label = data.get("RiskLabel", current.RiskLabel)
+            tier = _five_tier(data.get("RiskTier"), label)
+            if tier is not None:
+                data["RiskTier"] = tier
 
         if "EventId" in data and data["EventId"] is not None:
             cursor.execute("SELECT Id FROM Event WHERE Id = ?", data["EventId"])
