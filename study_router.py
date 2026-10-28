@@ -867,6 +867,27 @@ def coord_withdraw(pid: int, body: WithdrawIn, s: StaffSession = Depends(coordin
 
 
 # ----------------------------------------------------------------------------
+# Ingestion (called by the main API when the app saves a study couple's entry)
+# ----------------------------------------------------------------------------
+
+def ingest_entry(source_client_id: str, source_entry_id: str, created_at: datetime,
+                 text: str, tier: int) -> str:
+    """Adds one entry to the study and returns its Ingest_Status. The database
+    keeps the words only with that partner's B3 permission (B2 §5); otherwise
+    the entry is counted without them."""
+    conn = _connect(STUDY_APP_CS, "STUDY_APP_CONNECTION_STRING")
+    try:
+        with _sql():
+            cur = conn.cursor()
+            cur.execute("EXEC study.usp_Ingest_Entry @Source_Client_ID=?, @Source_Entry_ID=?, "
+                        "@Entry_Created_At=?, @Entry_Text=?, @Safety_Tier_At_Capture=?",
+                        source_client_id, source_entry_id, _utc_naive(created_at), text, tier)
+            return str(_rows(cur)[0]["Ingest_Status"])
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------------------
 # Monitor (Study Coordinator): labels and counts only
 # ----------------------------------------------------------------------------
 

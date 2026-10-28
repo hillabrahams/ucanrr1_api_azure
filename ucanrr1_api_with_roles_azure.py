@@ -71,7 +71,7 @@ app.add_middleware(
 
 # ==================== STUDY PAGES ====================
 # /study/* endpoints for annotate, adjudicate, coordinator and monitor pages.
-from study_router import router as study_router
+from study_router import router as study_router, ingest_entry as study_ingest_entry
 app.include_router(study_router)
 
 # ==================== DATABASE CONFIGURATION ====================
@@ -1473,6 +1473,34 @@ def read_client_study_status(client_id: int):
         row = cursor.fetchone()
     return {"clientId": client_id, "inStudy": row is not None,
             "studyStartAt": row.Study_Start_At if row else None}
+
+class StudyEntryIn(BaseModel):
+    IsClient1: bool
+    EventId: int
+    EntryCreatedAt: datetime
+    EntryText: str = Field(min_length=1, max_length=50000)
+    RiskTier: int = Field(ge=1, le=5)
+
+@app.post("/clients/{client_id}/study-entries")
+def ingest_study_entry(client_id: int, entry: StudyEntryIn):
+    """The app sends a journal entry here after saving its event, only while
+    the couple is in the feasibility study. The study database adds it to the
+    partner's participant record; it keeps the words only with that partner's
+    B3 permission, and skips entries before enrollment, while paused, after
+    withdrawal or after the study closed (the status says which)."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
+        if cursor.fetchone() is None:
+            return {"status": "NOT_ENROLLED"}
+        cursor.execute("SELECT ClientId FROM Event WHERE Id = ?", entry.EventId)
+        row = cursor.fetchone()
+    if row is None or row.ClientId != client_id:
+        raise HTTPException(status_code=404, detail="Event not found for this client")
+    partner = 1 if entry.IsClient1 else 2
+    status_ = study_ingest_entry(f"{client_id}-{partner}", f"event-{entry.EventId}",
+                                 entry.EntryCreatedAt, entry.EntryText, entry.RiskTier)
+    return {"status": status_}
 
 @app.put("/clients/{client_id}", response_model=Client)
 def update_client(client_id: int, client: ClientUpdate):
