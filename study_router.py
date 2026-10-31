@@ -914,6 +914,21 @@ def coord_export_participant(pid: int, s: StaffSession = Depends(coordinator_ses
             gold_labels = _rows(cur)
 
         cur.execute(
+            "SELECT Study_Assessment_Response_ID, Assessment_Code, Assessment_Name, Question_Text, "
+            "Question_Code, Answer_Text, Answer_Value, Response_Created_At, Ingested_At "
+            "FROM study.Study_Assessment_Response WHERE Study_Participant_ID = ? ORDER BY Response_Created_At",
+            pid)
+        assessment_responses = _rows(cur)
+
+        cur.execute(
+            "SELECT it.Interview_Transcript_ID, it.Interview_Conducted_At, it.Transcript_Text, "
+            "itd.Deid_Text, itd.Pipeline_Version AS Deid_Pipeline_Version, itd.Saved_At AS Deidentified_At "
+            "FROM study.Interview_Transcript it "
+            "LEFT JOIN study.Interview_Transcript_Deid itd ON itd.Interview_Transcript_ID = it.Interview_Transcript_ID "
+            "WHERE it.Study_Participant_ID = ? ORDER BY it.Interview_Conducted_At", pid)
+        interviews = _rows(cur)
+
+        cur.execute(
             "SELECT Audit_ID, Event_At, Action, Study_Entry_ID, Detail FROM study.Access_Audit "
             "WHERE Study_Participant_ID = ? ORDER BY Event_At", pid)
         audit = _rows(cur)
@@ -923,6 +938,8 @@ def coord_export_participant(pid: int, s: StaffSession = Depends(coordinator_ses
         "Entries": entries,
         "Annotations": annotations,
         "GoldLabels": gold_labels,
+        "AssessmentResponses": assessment_responses,
+        "InterviewTranscripts": interviews,
         "AccessAudit": audit,
     }
 
@@ -985,6 +1002,27 @@ def ingest_entry(source_client_id: str, source_entry_id: str, created_at: dateti
             cur.execute("EXEC study.usp_Ingest_Entry @Source_Client_ID=?, @Source_Entry_ID=?, "
                         "@Entry_Created_At=?, @Entry_Text=?, @Safety_Tier_At_Capture=?",
                         source_client_id, source_entry_id, _utc_naive(created_at), text, tier)
+            return str(_rows(cur)[0]["Ingest_Status"])
+    finally:
+        conn.close()
+
+
+def ingest_assessment_response(source_client_id: str, source_response_id: str, assessment_code: str,
+                               assessment_name: str, question_text: str, question_code: Optional[str],
+                               answer_text: str, answer_value: Optional[int], created_at: datetime) -> str:
+    """Adds one questionnaire response to the study's research-scoped copy
+    (study.Study_Assessment_Response, distinct from the clinical record in
+    dbo.Assessment_Response) and returns its Ingest_Status."""
+    conn = _connect(STUDY_APP_CS, "STUDY_APP_CONNECTION_STRING")
+    try:
+        with _sql():
+            cur = conn.cursor()
+            cur.execute(
+                "EXEC study.usp_Ingest_Assessment_Response @Source_Client_ID=?, @Source_Response_ID=?, "
+                "@Assessment_Code=?, @Assessment_Name=?, @Question_Text=?, @Question_Code=?, "
+                "@Answer_Text=?, @Answer_Value=?, @Response_Created_At=?",
+                source_client_id, source_response_id, assessment_code, assessment_name, question_text,
+                question_code, answer_text, answer_value, _utc_naive(created_at))
             return str(_rows(cur)[0]["Ingest_Status"])
     finally:
         conn.close()
@@ -1159,6 +1197,78 @@ def coord_run_deidentification(
     conn: pyodbc.Connection = Depends(deid_session),
 ):
     return run_deid_batch(conn, max_rows)
+
+
+def run_interview_deid_batch(conn: pyodbc.Connection, max_rows: int = 100) -> Dict[str, Any]:
+    """Same as run_deid_batch, for exit interview transcripts
+    (study.Interview_Transcript / study.Interview_Transcript_Deid) instead
+    of journal entries. Reuses the same HMAC secret and SurrogateStore, so
+    a participant's surrogates stay consistent between their journal
+    entries and their interview."""
+    secret, key_version = get_hmac_secret()
+    store = SqlSurrogateStore(conn)
+    pipeline_version = f"{DEID_PIPELINE_VERSION}+hmac_v{key_version}"
+
+    with _sql():
+        cur = conn.cursor()
+        cur.execute("EXEC study.usp_Get_Interview_Transcripts_For_Deid @Max_Rows=?", max_rows)
+        pending = cur.fetchall()
+        cur.close()  # otherwise the next cursor on this connection is "busy" (no MARS)
+
+    processed = 0
+    failed: List[Dict[str, Any]] = []
+    for row in pending:
+        try:
+            if row.Date_Offset_Days is None:
+                raise ValueError("participant has no Participant_Link date offset")
+            spans = detect_pii(row.Transcript_Text)
+            result = deidentify(
+                raw_text=row.Transcript_Text, spans=spans,
+                participant_id=str(row.Study_Participant_ID),
+                secret=secret, key_version=key_version,
+                date_offset_days=int(row.Date_Offset_Days),
+                reference_year=row.Interview_Conducted_At.year,
+                store=store,
+            )
+            with _sql():
+                save_cur = conn.cursor()
+                save_cur.execute(
+                    "EXEC study.usp_Save_Interview_Transcript_Deid @Interview_Transcript_ID=?, @Deid_Text=?, "
+                    "@Pipeline_Version=?",
+                    row.Interview_Transcript_ID, result.text, pipeline_version)
+                save_cur.close()
+            processed += 1
+        except Exception as e:
+            failed.append({"Interview_Transcript_ID": row.Interview_Transcript_ID, "error": str(e)})
+
+    return {"Pending": len(pending), "Processed": processed, "Failed": failed}
+
+
+@router.post("/coord/deidentify-interviews")
+def coord_run_interview_deidentification(
+    max_rows: int = Query(100, ge=1, le=1000),
+    conn: pyodbc.Connection = Depends(deid_session),
+):
+    return run_interview_deid_batch(conn, max_rows)
+
+
+class InterviewTranscriptIn(BaseModel):
+    Interview_Conducted_At: datetime
+    Transcript_Text: str = Field(min_length=1, max_length=200000)
+
+
+@router.post("/coord/participants/{pid}/interview-transcript")
+def coord_record_interview_transcript(pid: int, body: InterviewTranscriptIn,
+                                       s: StaffSession = Depends(coordinator_session)):
+    """Attachment G, A12: a coordinator records an exit interview transcript
+    after conducting it (there's no app-side capture path, unlike journal
+    entries). It's de-identified separately via /coord/deidentify-interviews."""
+    with _sql():
+        cur = s.cursor()
+        cur.execute("EXEC study.usp_Record_Interview_Transcript @Study_Participant_ID=?, "
+                    "@Interview_Conducted_At=?, @Transcript_Text=?",
+                    pid, _utc_naive(body.Interview_Conducted_At), body.Transcript_Text)
+        return {"Interview_Transcript_ID": int(_rows(cur)[0]["Interview_Transcript_ID"])}
 
 
 # ----------------------------------------------------------------------------

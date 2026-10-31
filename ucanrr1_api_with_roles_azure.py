@@ -71,7 +71,8 @@ app.add_middleware(
 
 # ==================== STUDY PAGES ====================
 # /study/* endpoints for annotate, adjudicate, coordinator and monitor pages.
-from study_router import router as study_router, ingest_entry as study_ingest_entry
+from study_router import (router as study_router, ingest_entry as study_ingest_entry,
+                           ingest_assessment_response as study_ingest_assessment_response)
 app.include_router(study_router)
 
 # ==================== DATABASE CONFIGURATION ====================
@@ -1500,6 +1501,40 @@ def ingest_study_entry(client_id: int, entry: StudyEntryIn):
     partner = 1 if entry.IsClient1 else 2
     status_ = study_ingest_entry(f"{client_id}-{partner}", f"event-{entry.EventId}",
                                  entry.EntryCreatedAt, entry.EntryText, entry.RiskTier)
+    return {"status": status_}
+
+class StudyAssessmentResponseIn(BaseModel):
+    Assessment_Response_ID: int
+
+@app.post("/clients/{client_id}/study-assessment-responses")
+def ingest_study_assessment_response(client_id: int, body: StudyAssessmentResponseIn):
+    """The app sends a submitted questionnaire response here after saving it,
+    only while the couple is in the feasibility study. Mirrors
+    ingest_study_entry: the study database keeps a research-scoped copy,
+    separate from the clinical record in Assessment_Response, that can be
+    deleted on withdrawal without touching it."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
+        if cursor.fetchone() is None:
+            return {"status": "NOT_ENROLLED"}
+        cursor.execute(
+            "SELECT ar.Client_ID, ar.IsClient1, ar.DateCreated, "
+            "a.AssessmentCode, a.AssessmentName, sq.Question_Text, sq.Question_Code, "
+            "sa.Answer_Text, ar.Answer_Value "
+            "FROM Assessment_Response ar "
+            "JOIN Assessment a ON a.Id = ar.Assessment_ID "
+            "JOIN Study_Questions sq ON sq.Study_Question_ID = ar.Study_Question_ID "
+            "JOIN Study_Answers sa ON sa.Study_Answer_ID = ar.Study_Answer_ID "
+            "WHERE ar.Assessment_Response_ID = ?", body.Assessment_Response_ID)
+        row = cursor.fetchone()
+    if row is None or row.Client_ID != client_id:
+        raise HTTPException(status_code=404, detail="Assessment response not found for this client")
+    partner = 1 if row.IsClient1 else 2
+    status_ = study_ingest_assessment_response(
+        f"{client_id}-{partner}", f"assessment_response-{body.Assessment_Response_ID}",
+        row.AssessmentCode, row.AssessmentName, row.Question_Text, row.Question_Code,
+        row.Answer_Text, row.Answer_Value, row.DateCreated)
     return {"status": status_}
 
 @app.put("/clients/{client_id}", response_model=Client)
