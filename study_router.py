@@ -142,7 +142,7 @@ _HTTP_FOR_SQL = {
     51001: 403, 51002: 404, 51003: 400, 51004: 400, 51005: 403,
     51006: 409, 51007: 400, 51008: 403,
     51021: 409, 51022: 409, 51023: 409, 51024: 400, 51025: 409, 51026: 400, 51027: 400, 51028: 409,
-    51030: 400, 51031: 400, 51032: 409,
+    51030: 400, 51031: 400, 51032: 409, 51033: 400,
     2601: 409, 2627: 409, 547: 400,
 }
 
@@ -925,6 +925,34 @@ def coord_export_participant(pid: int, s: StaffSession = Depends(coordinator_ses
         "GoldLabels": gold_labels,
         "AccessAudit": audit,
     }
+
+
+@router.get("/coord/linkage/erasure-candidates")
+def coord_linkage_erasure_candidates(grace_days: int = Query(90, ge=30, le=3650),
+                                      s: StaffSession = Depends(coordinator_session)):
+    """Attachment G, A6: which participants' linking key (Participant_Link --
+    Source_Client_ID and the de-identification date offset) is eligible for
+    erasure right now. Withdrawn participants qualify immediately; everyone
+    else only once the study is closed, every entry they kept text for has
+    been de-identified, and grace_days have passed since close."""
+    with _sql():
+        cur = s.cursor()
+        cur.execute("EXEC study.usp_Get_Linkage_Erasure_Candidates @Grace_Days=?", grace_days)
+        return _rows(cur)
+
+
+@router.post("/coord/linkage/erase-eligible")
+def coord_erase_eligible_linkage(grace_days: int = Query(90, ge=30, le=3650),
+                                  s: StaffSession = Depends(coordinator_session)):
+    """Erases every currently eligible Participant_Link row (re-checked
+    server-side against the same rule as the candidates list above, not
+    whatever the caller last fetched) and returns which participants were
+    erased."""
+    with _sql():
+        cur = s.cursor()
+        cur.execute("EXEC study.usp_Erase_Eligible_Linkage @Grace_Days=?", grace_days)
+        erased = [r["Study_Participant_ID"] for r in _rows(cur)]
+    return {"Erased": erased}
 
 
 # RCT-RESERVED (restricting an entry only hides it from annotators): not part of Judith Mildner's feasibility protocol v0.1;
