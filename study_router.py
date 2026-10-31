@@ -34,7 +34,7 @@ The §10.2 rating (schema: sql/study_patch_2026-10-17_rating.sql)
 Required App Service settings
     STUDY_GOOGLE_CLIENT_ID (the web client ID in study.js; if unset,
     GOOGLE_CLIENT_ID is used), STUDY_APP_CONNECTION_STRING,
-    STUDY_COORD_CONNECTION_STRING
+    STUDY_COORD_CONNECTION_STRING, STUDY_DEID_CONNECTION_STRING
 """
 from __future__ import annotations
 
@@ -54,6 +54,8 @@ import pyodbc
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
 
+from surrogate import SurrogateRow
+
 log = logging.getLogger("ucanrr.study")
 
 # ----------------------------------------------------------------------------
@@ -69,6 +71,7 @@ GOOGLE_CLIENT_ID = _env("STUDY_GOOGLE_CLIENT_ID") or _env("GOOGLE_CLIENT_ID")
 MAIN_CS = _env("AZURE_SQL_CONNECTION_STRING")
 STUDY_APP_CS = _env("STUDY_APP_CONNECTION_STRING")
 STUDY_COORD_CS = _env("STUDY_COORD_CONNECTION_STRING")
+STUDY_DEID_CS = _env("STUDY_DEID_CONNECTION_STRING")
 
 # Protocol v1.0: the study lead holds the study functions through the Study
 # Coordinator role. Human reading of entries happens only in the §10.2
@@ -885,6 +888,56 @@ def ingest_entry(source_client_id: str, source_entry_id: str, created_at: dateti
             return str(_rows(cur)[0]["Ingest_Status"])
     finally:
         conn.close()
+
+
+# ----------------------------------------------------------------------------
+# De-identification (protocol §9.4): surrogate.SurrogateStore backed by
+# study.Surrogate_Map, through the study_deid login. study_deid has EXECUTE
+# on exactly usp_Get_Surrogate / usp_Get_Used_Surrogates / usp_Put_Surrogate
+# and no direct table access (study_patch_2026-10-31_surrogate_map.sql) --
+# the same least-privilege pattern as study_app and study_coordinator.
+# ----------------------------------------------------------------------------
+
+class SqlSurrogateStore:
+    """surrogate.SurrogateStore, backed by an existing connection on the
+    study_deid login. The caller owns the connection's lifetime so one
+    connection can serve every span of an entry, or a whole batch."""
+
+    def __init__(self, conn: pyodbc.Connection):
+        self._conn = conn
+
+    def get(self, participant: str, entity_type: str, key_version: int, h: bytes) -> Optional[str]:
+        with _sql():
+            cur = self._conn.cursor()
+            cur.execute(
+                "EXEC study.usp_Get_Surrogate @Study_Participant_ID=?, @Entity_Type=?, "
+                "@Hmac_Key_Version=?, @Original_Hmac=?",
+                int(participant), entity_type, key_version, h)
+            row = cur.fetchone()
+            return row.Surrogate_Value if row else None
+
+    def used_values(self, participant: str, entity_type: str) -> set[str]:
+        with _sql():
+            cur = self._conn.cursor()
+            cur.execute(
+                "EXEC study.usp_Get_Used_Surrogates @Study_Participant_ID=?, @Entity_Type=?",
+                int(participant), entity_type)
+            return {r.Surrogate_Value for r in cur.fetchall()}
+
+    def put(self, row: SurrogateRow) -> None:
+        with _sql():
+            cur = self._conn.cursor()
+            cur.execute(
+                "EXEC study.usp_Put_Surrogate @Study_Participant_ID=?, @Entity_Type=?, "
+                "@Hmac_Key_Version=?, @Original_Hmac=?, @Role_Label=?, @Surrogate_Value=?",
+                int(row.study_participant_id), row.entity_type, row.hmac_key_version,
+                row.original_hmac, row.role_label, row.surrogate_value)
+
+
+def deid_connect() -> pyodbc.Connection:
+    """Opens the study_deid connection a SqlSurrogateStore (or a future
+    de-identification orchestrator) runs on."""
+    return _connect(STUDY_DEID_CS, "STUDY_DEID_CONNECTION_STRING")
 
 
 # ----------------------------------------------------------------------------
