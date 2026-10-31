@@ -869,6 +869,64 @@ def coord_withdraw(pid: int, body: WithdrawIn, s: StaffSession = Depends(coordin
     return {"ok": True}
 
 
+@router.get("/coord/participants/{pid}/export")
+def coord_export_participant(pid: int, s: StaffSession = Depends(coordinator_session)):
+    """Attachment G, A8: participants don't get a self-service portal, so a
+    coordinator assembles and hands over a participant's own study data on
+    request. Covers exactly what usp_Withdraw_Participant deletes, plus
+    that participant's own audit trail; never Date_Offset_Days (the
+    de-identification secret, not the participant's data)."""
+    with _sql():
+        cur = s.cursor()
+        cur.execute("EXEC study.usp_Record_Export_Access @Study_Participant_ID=?", pid)
+
+        cur.execute(
+            "SELECT sp.Study_Participant_ID, sp.Couple_ID, pl.Source_Client_ID, sp.Consent_Version, "
+            "sp.Research_Consent_At, sp.Clinician_Attestation_Date, sp.Research_Paused_At, sp.Pause_Reason, "
+            "sp.Withdrawn_At, sp.Created_At, sp.Text_Retention_At, sp.Text_Retention_Version "
+            "FROM study.Study_Participant sp "
+            "LEFT JOIN study.Participant_Link pl ON pl.Study_Participant_ID = sp.Study_Participant_ID "
+            "WHERE sp.Study_Participant_ID = ?", pid)
+        participant = _rows(cur)[0]
+
+        cur.execute(
+            "SELECT e.Study_Entry_ID, e.Entry_Created_At, e.Entry_Text, e.Safety_Tier_At_Capture, "
+            "e.Is_Restricted, e.Ingested_At, d.Deid_Text, d.Pipeline_Version AS Deid_Pipeline_Version, "
+            "d.Saved_At AS Deidentified_At "
+            "FROM study.Study_Entry e LEFT JOIN study.Entry_Deid d ON d.Study_Entry_ID = e.Study_Entry_ID "
+            "WHERE e.Study_Participant_ID = ? ORDER BY e.Entry_Created_At", pid)
+        entries = _rows(cur)
+
+        annotations: List[Dict[str, Any]] = []
+        gold_labels: List[Dict[str, Any]] = []
+        entry_ids = [r["Study_Entry_ID"] for r in entries]
+        if entry_ids:
+            placeholders = ",".join("?" * len(entry_ids))
+            cur.execute(
+                f"SELECT Study_Entry_ID, Annotator_ID, Version_No, IsNeglect, IsRepair, IsBid, IsCare, IsShared, "
+                f"Sentiment, Safety_Tier, Created_At FROM study.Annotation "
+                f"WHERE Study_Entry_ID IN ({placeholders}) AND Is_Current = 1 ORDER BY Study_Entry_ID", *entry_ids)
+            annotations = _rows(cur)
+            cur.execute(
+                f"SELECT Study_Entry_ID, Adjudicator_ID, Method, IsNeglect, IsRepair, IsBid, IsCare, IsShared, "
+                f"Sentiment, Safety_Tier, Created_At FROM study.Gold_Label "
+                f"WHERE Study_Entry_ID IN ({placeholders}) ORDER BY Study_Entry_ID", *entry_ids)
+            gold_labels = _rows(cur)
+
+        cur.execute(
+            "SELECT Audit_ID, Event_At, Action, Study_Entry_ID, Detail FROM study.Access_Audit "
+            "WHERE Study_Participant_ID = ? ORDER BY Event_At", pid)
+        audit = _rows(cur)
+
+    return {
+        "Participant": participant,
+        "Entries": entries,
+        "Annotations": annotations,
+        "GoldLabels": gold_labels,
+        "AccessAudit": audit,
+    }
+
+
 # RCT-RESERVED (restricting an entry only hides it from annotators): not part of Judith Mildner's feasibility protocol v0.1;
 # kept for a possible RCT design. Uncomment to restore.
 # @router.post("/coord/entries/{entry_id}/restrict")
