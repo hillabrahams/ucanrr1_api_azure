@@ -54,7 +54,7 @@ import pyodbc
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
 
-from surrogate import SurrogateRow
+from surrogate import DetectedSpan, SurrogateRow, deidentify
 
 log = logging.getLogger("ucanrr.study")
 
@@ -359,6 +359,20 @@ def escalation_session(p: Principal = Depends(get_principal)) -> Iterator[StaffS
         with _sql():
             _set_ctx(conn.cursor(), "actor_user_id", str(p.user_id))
         yield StaffSession(conn, p)
+    finally:
+        conn.close()
+
+
+def deid_session(p: Principal = Depends(get_principal)) -> Iterator[pyodbc.Connection]:
+    # Triggering a de-identification batch is a coordinator action, but the
+    # work itself runs on study_deid, the only login with EXECUTE on the
+    # surrogate/entries-for-deid procedures -- least privilege, separate
+    # from study_coordinator's broader schema-level SELECT.
+    if p.role not in COORDINATOR_ROLES:
+        raise HTTPException(403, "This page is for the study coordinator.")
+    conn = _connect(STUDY_DEID_CS, "STUDY_DEID_CONNECTION_STRING")
+    try:
+        yield conn
     finally:
         conn.close()
 
@@ -914,6 +928,7 @@ class SqlSurrogateStore:
                 "@Hmac_Key_Version=?, @Original_Hmac=?",
                 int(participant), entity_type, key_version, h)
             row = cur.fetchone()
+            cur.close()  # otherwise the next cursor on this connection is "busy" (no MARS)
             return row.Surrogate_Value if row else None
 
     def used_values(self, participant: str, entity_type: str) -> set[str]:
@@ -922,7 +937,9 @@ class SqlSurrogateStore:
             cur.execute(
                 "EXEC study.usp_Get_Used_Surrogates @Study_Participant_ID=?, @Entity_Type=?",
                 int(participant), entity_type)
-            return {r.Surrogate_Value for r in cur.fetchall()}
+            values = {r.Surrogate_Value for r in cur.fetchall()}
+            cur.close()
+            return values
 
     def put(self, row: SurrogateRow) -> None:
         with _sql():
@@ -932,12 +949,130 @@ class SqlSurrogateStore:
                 "@Hmac_Key_Version=?, @Original_Hmac=?, @Role_Label=?, @Surrogate_Value=?",
                 int(row.study_participant_id), row.entity_type, row.hmac_key_version,
                 row.original_hmac, row.role_label, row.surrogate_value)
+            cur.close()
 
 
 def deid_connect() -> pyodbc.Connection:
     """Opens the study_deid connection a SqlSurrogateStore (or a future
     de-identification orchestrator) runs on."""
     return _connect(STUDY_DEID_CS, "STUDY_DEID_CONNECTION_STRING")
+
+
+_deid_secret_cache: Optional[tuple[bytes, int]] = None
+
+
+def get_hmac_secret() -> tuple[bytes, int]:
+    """The de-identification pipeline's HMAC key and its version, from Key
+    Vault (AZURE_KEY_VAULT_URL / STUDY_DEID_HMAC_SECRET_NAME /
+    STUDY_DEID_HMAC_KEY_VERSION). Cached for the life of the process.
+    Authenticates as the App Service's managed identity in Azure, or the
+    signed-in `az` account for local development (DefaultAzureCredential)."""
+    global _deid_secret_cache
+    if _deid_secret_cache is None:
+        vault_url = _env("AZURE_KEY_VAULT_URL")
+        if not vault_url:
+            raise HTTPException(503, "De-identification is not configured (AZURE_KEY_VAULT_URL).")
+        secret_name = _env("STUDY_DEID_HMAC_SECRET_NAME") or "study-deid-hmac-key-v1"
+        version = int(_env("STUDY_DEID_HMAC_KEY_VERSION") or "1")
+        from azure.identity import DefaultAzureCredential
+        from azure.keyvault.secrets import SecretClient
+        client = SecretClient(vault_url=vault_url, credential=DefaultAzureCredential())
+        secret_hex = client.get_secret(secret_name).value
+        _deid_secret_cache = (bytes.fromhex(secret_hex), version)
+    return _deid_secret_cache
+
+
+# Azure AI Language's PII categories -> surrogate.py's entity types. Anything
+# not listed here passes through uppercased; deidentify() already falls back
+# to a generic bracket (e.g. "[IPADDRESS]") for a type with no surrogate pool.
+_PII_CATEGORY_MAP = {
+    "Person": "PERSON",
+    "Organization": "ORG",
+    "Address": "LOCATION",
+    "Email": "EMAIL",
+    "PhoneNumber": "PHONE",
+    "URL": "URL",
+    "DateTime": "DATE",   # deidentify() shifts this type instead of bracketing it
+}
+
+
+def detect_pii(text: str) -> list[DetectedSpan]:
+    """Runs entry text through Azure AI Language's PII detection, returning
+    surrogate.DetectedSpan records for deidentify() to consume. Reuses the
+    same AIServices resource as scoring (analyzeapi's AZURE_OPENAI_ENDPOINT),
+    reached as the App Service's managed identity -- no extra key to store."""
+    endpoint = _env("AZURE_LANGUAGE_ENDPOINT")
+    if not endpoint:
+        raise HTTPException(503, "De-identification is not configured (AZURE_LANGUAGE_ENDPOINT).")
+    from azure.ai.textanalytics import TextAnalyticsClient
+    from azure.identity import DefaultAzureCredential
+    client = TextAnalyticsClient(endpoint=endpoint, credential=DefaultAzureCredential())
+    result = client.recognize_pii_entities([text])[0]
+    if result.is_error:
+        raise HTTPException(502, f"PII detection failed: {result.error.message}")
+    return [
+        DetectedSpan(
+            start=e.offset, end=e.offset + e.length,
+            entity_type=_PII_CATEGORY_MAP.get(e.category, e.category.upper()),
+            detector="AZURE_PII",
+            confidence=e.confidence_score,
+        )
+        for e in result.entities
+    ]
+
+
+DEID_PIPELINE_VERSION = "surrogate/1.0+azure_pii"
+
+
+def run_deid_batch(conn: pyodbc.Connection, max_rows: int = 100) -> Dict[str, Any]:
+    """Pulls up to max_rows entries awaiting de-identification (kept text,
+    not yet in study.Entry_Deid), runs each through detect_pii() and
+    deidentify(), and saves the result. One entry's failure doesn't stop
+    the rest of the batch; failures are collected and returned."""
+    secret, key_version = get_hmac_secret()
+    store = SqlSurrogateStore(conn)
+    pipeline_version = f"{DEID_PIPELINE_VERSION}+hmac_v{key_version}"
+
+    with _sql():
+        cur = conn.cursor()
+        cur.execute("EXEC study.usp_Get_Entries_For_Deid @Max_Rows=?", max_rows)
+        pending = cur.fetchall()
+        cur.close()  # otherwise the next cursor on this connection is "busy" (no MARS)
+
+    processed = 0
+    failed: List[Dict[str, Any]] = []
+    for row in pending:
+        try:
+            if row.Date_Offset_Days is None:
+                raise ValueError("participant has no Participant_Link date offset")
+            spans = detect_pii(row.Entry_Text)
+            result = deidentify(
+                raw_text=row.Entry_Text, spans=spans,
+                participant_id=str(row.Study_Participant_ID),
+                secret=secret, key_version=key_version,
+                date_offset_days=int(row.Date_Offset_Days),
+                reference_year=row.Entry_Created_At.year,
+                store=store,
+            )
+            with _sql():
+                save_cur = conn.cursor()
+                save_cur.execute(
+                    "EXEC study.usp_Save_Deid_Text @Study_Entry_ID=?, @Deid_Text=?, @Pipeline_Version=?",
+                    row.Study_Entry_ID, result.text, pipeline_version)
+                save_cur.close()
+            processed += 1
+        except Exception as e:
+            failed.append({"Study_Entry_ID": row.Study_Entry_ID, "error": str(e)})
+
+    return {"Pending": len(pending), "Processed": processed, "Failed": failed}
+
+
+@router.post("/coord/deidentify")
+def coord_run_deidentification(
+    max_rows: int = Query(100, ge=1, le=1000),
+    conn: pyodbc.Connection = Depends(deid_session),
+):
+    return run_deid_batch(conn, max_rows)
 
 
 # ----------------------------------------------------------------------------
