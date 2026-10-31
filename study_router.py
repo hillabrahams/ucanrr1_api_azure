@@ -929,6 +929,12 @@ def coord_export_participant(pid: int, s: StaffSession = Depends(coordinator_ses
         interviews = _rows(cur)
 
         cur.execute(
+            "SELECT Study_Reminder_Delivery_ID, Reminder_Type, Event_Type, Scheduled_At, Detected_At, Ingested_At "
+            "FROM study.Study_Reminder_Delivery WHERE Study_Participant_ID = ? ORDER BY Scheduled_At",
+            pid)
+        reminder_deliveries = _rows(cur)
+
+        cur.execute(
             "SELECT Audit_ID, Event_At, Action, Study_Entry_ID, Detail FROM study.Access_Audit "
             "WHERE Study_Participant_ID = ? ORDER BY Event_At", pid)
         audit = _rows(cur)
@@ -940,6 +946,7 @@ def coord_export_participant(pid: int, s: StaffSession = Depends(coordinator_ses
         "GoldLabels": gold_labels,
         "AssessmentResponses": assessment_responses,
         "InterviewTranscripts": interviews,
+        "ReminderDeliveries": reminder_deliveries,
         "AccessAudit": audit,
     }
 
@@ -1023,6 +1030,27 @@ def ingest_assessment_response(source_client_id: str, source_response_id: str, a
                 "@Answer_Text=?, @Answer_Value=?, @Response_Created_At=?",
                 source_client_id, source_response_id, assessment_code, assessment_name, question_text,
                 question_code, answer_text, answer_value, _utc_naive(created_at))
+            return str(_rows(cur)[0]["Ingest_Status"])
+    finally:
+        conn.close()
+
+
+def ingest_reminder_delivery(source_client_id: str, source_event_id: str, reminder_type: str,
+                             event_type: str, scheduled_at: datetime, detected_at: datetime) -> str:
+    """Adds one reminder delivery record (Attachment G, B2) and returns its
+    Ingest_Status. Unlike ingest_entry/ingest_assessment_response there's no
+    production row to look up -- the mobile app infers delivery itself (no
+    native 'this fired' callback exists), so source_event_id is just a
+    dedup key the app generates, not a foreign key into anything."""
+    conn = _connect(STUDY_APP_CS, "STUDY_APP_CONNECTION_STRING")
+    try:
+        with _sql():
+            cur = conn.cursor()
+            cur.execute(
+                "EXEC study.usp_Ingest_Reminder_Delivery @Source_Client_ID=?, @Source_Event_ID=?, "
+                "@Reminder_Type=?, @Event_Type=?, @Scheduled_At=?, @Detected_At=?",
+                source_client_id, source_event_id, reminder_type, event_type,
+                _utc_naive(scheduled_at), _utc_naive(detected_at))
             return str(_rows(cur)[0]["Ingest_Status"])
     finally:
         conn.close()

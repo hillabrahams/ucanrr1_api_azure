@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
-from typing import Optional, List
+from typing import Optional, List, Literal
 import pyodbc
 from datetime import datetime, date
 from contextlib import contextmanager
@@ -72,7 +72,8 @@ app.add_middleware(
 # ==================== STUDY PAGES ====================
 # /study/* endpoints for annotate, adjudicate, coordinator and monitor pages.
 from study_router import (router as study_router, ingest_entry as study_ingest_entry,
-                           ingest_assessment_response as study_ingest_assessment_response)
+                           ingest_assessment_response as study_ingest_assessment_response,
+                           ingest_reminder_delivery as study_ingest_reminder_delivery)
 app.include_router(study_router)
 
 # ==================== DATABASE CONFIGURATION ====================
@@ -1535,6 +1536,34 @@ def ingest_study_assessment_response(client_id: int, body: StudyAssessmentRespon
         f"{client_id}-{partner}", f"assessment_response-{body.Assessment_Response_ID}",
         row.AssessmentCode, row.AssessmentName, row.Question_Text, row.Question_Code,
         row.Answer_Text, row.Answer_Value, row.DateCreated)
+    return {"status": status_}
+
+class StudyReminderDeliveryIn(BaseModel):
+    IsClient1: bool
+    Reminder_Type: Literal["DAILY", "WEEKLY"]
+    Event_Type: Literal["FIRED_INFERRED", "TAPPED"]
+    Scheduled_At: datetime
+    Detected_At: datetime
+    Source_Event_ID: str = Field(min_length=1, max_length=128)
+
+@app.post("/clients/{client_id}/study-reminder-deliveries")
+def ingest_study_reminder_delivery(client_id: int, body: StudyReminderDeliveryIn):
+    """The app sends a reminder delivery record here (Attachment G, B2), only
+    while the couple is in the feasibility study. Unlike study-entries and
+    study-assessment-responses, there's no production table a reminder
+    belongs to -- it only ever existed as on-device notification state -- so
+    IsClient1 is taken from the app's own session the same way it already is
+    for Assessment_Response elsewhere, and Source_Event_ID is just the app's
+    own dedup key rather than a row to look up and verify ownership of."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
+        if cursor.fetchone() is None:
+            return {"status": "NOT_ENROLLED"}
+    partner = 1 if body.IsClient1 else 2
+    status_ = study_ingest_reminder_delivery(
+        f"{client_id}-{partner}", body.Source_Event_ID, body.Reminder_Type, body.Event_Type,
+        body.Scheduled_At, body.Detected_At)
     return {"status": status_}
 
 @app.put("/clients/{client_id}", response_model=Client)
