@@ -83,7 +83,7 @@ app.include_router(study_router)
 
 CONNECTION_STRING = os.environ.get(
     "AZURE_SQL_CONNECTION_STRING",
-    "Driver={ODBC Driver 17 for SQL Server};Server=tcp:Pip1.database.windows.net,1433;Database=Pip1;Uid=hillabrahams@Pip1;Pwd=Abhabhabh0919?;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    "PLACEHOLDER_REPLACE_WITH_AZURE_SQL_CONNECTION_STRING"
 )
 
 @contextmanager
