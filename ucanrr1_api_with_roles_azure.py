@@ -52,6 +52,8 @@ else:
 # (off / report / enforce) is an App Service setting; see api_auth.py.
 from api_auth import install_auth
 install_auth(app)
+from api_authz import (require_body_access, deny as authz_deny, is_admin as authz_is_admin,
+                       visible_client_ids, forget_caller)
 
 # ==================== CORS CONFIGURATION ====================
 
@@ -960,10 +962,17 @@ def read_role_users(
 # ==================== AUTHORIZED USERS CRUD (UPDATED) ====================
 
 @app.post("/authorized-users/", response_model=AuthorizedUser, status_code=status.HTTP_201_CREATED)
-def create_authorized_user(user: AuthorizedUserCreate):
-    """Create a new authorized user"""
+def create_authorized_user(user: AuthorizedUserCreate, request: Request):
+    """Create a new authorized user. Therapists may add client accounts only."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
+
+        if not authz_is_admin(request):
+            cursor.execute("SELECT RoleID FROM Roles WHERE LTRIM(RTRIM(RoleName)) = 'Client'")
+            client_role = cursor.fetchone()
+            if not client_role or user.RoleID != client_role.RoleID or user.HasInformedConsent:
+                authz_deny(request, "non-admin may only create client accounts")
+        forget_caller(user.Email)
 
         # Verify RoleID exists if provided
         if user.RoleID is not None:
@@ -1172,8 +1181,13 @@ def read_authorized_user_by_email(email: str):
         }
 
 @app.put("/authorized-users/{user_id}", response_model=AuthorizedUser)
-def update_authorized_user(user_id: int, user: AuthorizedUserUpdate):
-    """Update an authorized user"""
+def update_authorized_user(user_id: int, user: AuthorizedUserUpdate, request: Request):
+    """Update an authorized user. A non-admin may only record their own consent."""
+    if not authz_is_admin(request):
+        changed = {k for k, v in user.model_dump(exclude_unset=True).items() if v is not None}
+        if changed - {"HasInformedConsent"}:
+            authz_deny(request, "non-admin may only set HasInformedConsent")
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -1246,6 +1260,7 @@ def update_last_login(user_id: int):
 @app.delete("/authorized-users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_authorized_user(user_id: int):
     """Delete an authorized user"""
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM AuthorizedUsers WHERE UserID = ?", user_id)
@@ -1258,6 +1273,7 @@ def delete_authorized_user(user_id: int):
 @app.post("/therapists/", response_model=Therapist, status_code=status.HTTP_201_CREATED)
 def create_therapist(therapist: TherapistCreate):
     """Create a new therapist"""
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -1327,6 +1343,7 @@ def read_therapist(therapist_id: int):
 @app.put("/therapists/{therapist_id}", response_model=Therapist)
 def update_therapist(therapist_id: int, therapist: TherapistUpdate):
     """Update a therapist"""
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -1364,8 +1381,10 @@ def delete_therapist(therapist_id: int):
 # ==================== CLIENT CRUD ====================
 
 @app.post("/clients/", response_model=Client, status_code=status.HTTP_201_CREATED)
-def create_client(client: ClientCreate):
+def create_client(client: ClientCreate, request: Request):
     """Create a new client"""
+    require_body_access(request, therapist_id=client.TherapistID, reason="couple for another therapist")
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -1567,8 +1586,11 @@ def ingest_study_reminder_delivery(client_id: int, body: StudyReminderDeliveryIn
     return {"status": status_}
 
 @app.put("/clients/{client_id}", response_model=Client)
-def update_client(client_id: int, client: ClientUpdate):
+def update_client(client_id: int, client: ClientUpdate, request: Request):
     """Update a client"""
+    if client.TherapistID is not None:
+        require_body_access(request, therapist_id=client.TherapistID, reason="move couple to another therapist")
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -1596,6 +1618,7 @@ def update_client(client_id: int, client: ClientUpdate):
 @app.delete("/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_client(client_id: int):
     """Delete a client"""
+    forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM Client WHERE Id = ?", client_id)
@@ -1606,8 +1629,9 @@ def delete_client(client_id: int):
 # ==================== EVENT CRUD ====================
 
 @app.post("/events/", response_model=Event, status_code=status.HTTP_201_CREATED)
-def create_event(event: EventCreate):
+def create_event(event: EventCreate, request: Request):
     """Create a new event"""
+    require_body_access(request, client_id=event.ClientId)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -1716,8 +1740,10 @@ def read_event(event_id: int):
         }
 
 @app.put("/events/{event_id}", response_model=Event)
-def update_event(event_id: int, event: EventUpdate):
+def update_event(event_id: int, event: EventUpdate, request: Request):
     """Update an event"""
+    if event.ClientId is not None:
+        require_body_access(request, client_id=event.ClientId)
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -1933,8 +1959,9 @@ def get_therapist_statistics(therapist_id: int):
 # ==================== SESSION DATE CRUD ====================
 
 @app.post("/session-dates/", response_model=SessionDateModel, status_code=status.HTTP_201_CREATED)
-def create_session_date(session_date: SessionDateCreate):
+def create_session_date(session_date: SessionDateCreate, request: Request):
     """Create a new session date"""
+    require_body_access(request, client_id=session_date.ClientId)
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT Id FROM Client WHERE Id = ?", session_date.ClientId)
@@ -1955,7 +1982,8 @@ def read_session_dates(
     start_date: Optional[date] = Query(None, description="Filter session dates from this date"),
     end_date: Optional[date] = Query(None, description="Filter session dates until this date"),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return")
+    limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
+    request: Request = None
 ):
     """Get all session dates with optional filtering and pagination"""
     with get_db_connection() as conn:
@@ -1963,6 +1991,13 @@ def read_session_dates(
 
         query = "SELECT Id, ClientId, SessionDate FROM SessionDate WHERE 1=1"
         params = []
+
+        visible = visible_client_ids(request) if request is not None else None
+        if visible is not None:
+            if not visible:
+                return []
+            query += f" AND ClientId IN ({','.join('?' * len(visible))})"
+            params.extend(sorted(visible))
 
         if client_id is not None:
             query += " AND ClientId = ?"
@@ -1995,8 +2030,10 @@ def read_session_date(session_date_id: int):
         return {"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate}
 
 @app.put("/session-dates/{session_date_id}", response_model=SessionDateModel)
-def update_session_date(session_date_id: int, session_date: SessionDateUpdate):
+def update_session_date(session_date_id: int, session_date: SessionDateUpdate, request: Request):
     """Update a session date"""
+    if session_date.ClientId is not None:
+        require_body_access(request, client_id=session_date.ClientId)
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -2087,8 +2124,9 @@ def _sa_row(row):
     }
 
 @app.post("/safety-assessments/", response_model=SafetyAssessmentModel, status_code=status.HTTP_201_CREATED)
-def create_safety_assessment(assessment: SafetyAssessmentCreate):
+def create_safety_assessment(assessment: SafetyAssessmentCreate, request: Request):
     """Create a new safety assessment"""
+    require_body_access(request, client_id=assessment.ClientId)
     with get_db_connection() as conn:
         cursor = conn.cursor()
 

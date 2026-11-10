@@ -15,8 +15,9 @@ valid token:
 Log lines never contain the token or the email, only the outcome, token kind,
 method, path, origin and app user agent, so they are safe to keep.
 
-Per-role rules (which client a caller may read) are a later step; this module
-only answers "who is calling".
+Per-role rules (which client a caller may read) live in api_authz.py; once
+a token verifies, the middleware asks it whether this caller may make this
+request. A denial is logged as authz=deny, and is a 403 only in enforce.
 
 Add to ucanrr1_api_with_roles_azure.py, after `app` is created and BEFORE the
 CORS middleware, so CORS stays outermost and a 401 still carries CORS headers:
@@ -136,15 +137,16 @@ def install_auth(app: FastAPI) -> None:
     async def _auth(request: Request, call_next):
         request.state.auth_email = None
         request.state.auth_kind = None
+        request.state.caller = None
         path = request.url.path
         if request.method == "OPTIONS" or _is_open(path):
             return await call_next(request)
 
+        from starlette.concurrency import run_in_threadpool
         header = request.headers.get("authorization", "")
         outcome, kind = "missing", None
         if header.lower().startswith("bearer ") and header[7:].strip():
             # Token checks may fetch Google's certificates; keep them off the event loop.
-            from starlette.concurrency import run_in_threadpool
             verified = await run_in_threadpool(verify_bearer, header[7:].strip())
             if verified:
                 outcome, kind = "ok", verified["kind"]
@@ -152,6 +154,24 @@ def install_auth(app: FastAPI) -> None:
                 request.state.auth_kind = kind
             else:
                 outcome = "invalid"
+
+        if outcome == "ok":
+            # Who they are is settled; now check what they may do (api_authz.py).
+            from api_authz import decide
+            try:
+                reason, caller = await run_in_threadpool(
+                    decide, request.method, path, dict(request.query_params), request.state.auth_email)
+                request.state.caller = caller
+            except Exception:
+                log.exception("authz lookup failed %s %s", request.method, path)
+                if AUTH_MODE == "enforce":
+                    return JSONResponse({"detail": "Please try again in a moment."}, status_code=503)
+                reason = None
+            if reason:
+                log.warning("authz=deny mode=%s kind=%s %s %s reason=%s", AUTH_MODE, kind,
+                            request.method, path, reason)
+                if AUTH_MODE == "enforce":
+                    return JSONResponse({"detail": "You don't have access to this."}, status_code=403)
 
         if outcome != "ok":
             log.warning("auth=%s mode=%s %s %s origin=%s ua=%s", outcome, AUTH_MODE, request.method, path,
