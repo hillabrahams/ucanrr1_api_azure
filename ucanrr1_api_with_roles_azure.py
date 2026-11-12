@@ -50,7 +50,9 @@ else:
 # ==================== CALLER IDENTITY ====================
 # Installed before CORS so CORS stays the outermost middleware. AUTH_MODE
 # (off / report / enforce) is an App Service setting; see api_auth.py.
-from api_auth import install_auth
+import logging
+log_study = logging.getLogger("ucanrr.study.ingest")
+from api_auth import install_auth, AUTH_MODE
 install_auth(app)
 from api_authz import (require_body_access, deny as authz_deny, is_admin as authz_is_admin,
                        visible_client_ids, forget_caller)
@@ -1496,32 +1498,114 @@ def read_client_study_status(client_id: int):
             "studyStartAt": row.Study_Start_At if row else None}
 
 class StudyEntryIn(BaseModel):
-    IsClient1: bool
+    # IsClient1 and RiskTier are still accepted so the current app keeps
+    # working, but neither is trusted: the partner comes from the signed-in
+    # caller and the tier from the saved safety assessment (see below).
+    IsClient1: Optional[bool] = None
     EventId: int
     EntryCreatedAt: datetime
     EntryText: str = Field(min_length=1, max_length=50000)
-    RiskTier: int = Field(ge=1, le=5)
+    RiskTier: Optional[int] = Field(default=None, ge=1, le=5)
+    # The SafetyAssessment row the app saved for this entry before the event
+    # existed. The API links it to the event here, so the study never depends
+    # on the app's separate linkEvent call having happened first.
+    SafetyAssessmentId: Optional[int] = None
+
+
+def _caller_partner(request: Request, cursor, client_id: int) -> Optional[int]:
+    """1 or 2 when the signed-in caller is that partner of this couple, else None."""
+    email = getattr(request.state, "auth_email", None)
+    if not email:
+        return None
+    cursor.execute(
+        "SELECT CASE WHEN LOWER(LTRIM(RTRIM(Client1UserName))) = ? THEN 1 "
+        "            WHEN LOWER(LTRIM(RTRIM(Client2UserName))) = ? THEN 2 END AS Partner "
+        "FROM Client WHERE Id = ?", email, email, client_id)
+    row = cursor.fetchone()
+    return int(row.Partner) if row and row.Partner is not None else None
 
 @app.post("/clients/{client_id}/study-entries")
-def ingest_study_entry(client_id: int, entry: StudyEntryIn):
+def ingest_study_entry(client_id: int, entry: StudyEntryIn, request: Request):
     """The app sends a journal entry here after saving its event, only while
     the couple is in the feasibility study. The study database adds it to the
     partner's participant record; it keeps the words only with that partner's
     B3 permission, and skips entries before enrollment, while paused, after
-    withdrawal or after the study closed (the status says which)."""
+    withdrawal or after the study closed (the status says which).
+
+    Trust rules:
+    - Partner: the signed-in caller's own partner slot on this couple, which
+      must match the event's. The body's IsClient1 is ignored.
+    - Safety tier: from the saved SafetyAssessment, never from the body.
+      The app names its assessment (SafetyAssessmentId); it must belong to
+      this couple and partner and be unlinked or linked to this event, and
+      is linked here. Any other assessment already linked to the event also
+      counts; the highest tier wins. A tier in the body can only raise it.
+    - No saved assessment: 409 SAFETY_PENDING in enforce, so escalation
+      always comes before research. In report mode (app builds that predate
+      SafetyAssessmentId) the body's tier is used and the fallback is logged."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
         if cursor.fetchone() is None:
             return {"status": "NOT_ENROLLED"}
-        cursor.execute("SELECT ClientId FROM Event WHERE Id = ?", entry.EventId)
+
+        cursor.execute("SELECT ClientId, IsClient1 FROM Event WHERE Id = ?", entry.EventId)
+        ev = cursor.fetchone()
+        if ev is None or ev.ClientId != client_id:
+            raise HTTPException(status_code=404, detail="Event not found for this client")
+        event_partner = 1 if ev.IsClient1 else 2
+
+        caller_partner = _caller_partner(request, cursor, client_id)
+        if caller_partner is None:
+            # Not one of this couple's partners (or no token in report mode).
+            authz_deny(request, "study entry from someone other than the couple's partners")
+        elif caller_partner != event_partner:
+            # 403 in enforce; in report mode it's logged and the event's own
+            # partner is used, as before.
+            authz_deny(request, "study entry for the other partner's event")
+        partner = event_partner
+
+        tiers = []
+        if entry.SafetyAssessmentId is not None:
+            cursor.execute("SELECT ClientId, IsClient1, EventId, RiskTier FROM SafetyAssessment WHERE Id = ?",
+                           entry.SafetyAssessmentId)
+            sa = cursor.fetchone()
+            if (sa is None or sa.ClientId != client_id or (1 if sa.IsClient1 else 2) != partner
+                    or (sa.EventId is not None and sa.EventId != entry.EventId)):
+                raise HTTPException(status_code=409,
+                                    detail="SAFETY_MISMATCH: that safety assessment doesn't belong to this entry.")
+            if sa.EventId is None:
+                cursor.execute("UPDATE SafetyAssessment SET EventId = ? WHERE Id = ? AND EventId IS NULL",
+                               entry.EventId, entry.SafetyAssessmentId)
+                conn.commit()
+            if sa.RiskTier is not None:
+                tiers.append(int(sa.RiskTier))
+
+        cursor.execute(
+            "SELECT MAX(RiskTier) AS Tier FROM SafetyAssessment "
+            "WHERE EventId = ? AND ClientId = ? AND RiskTier IS NOT NULL",
+            entry.EventId, client_id)
         row = cursor.fetchone()
-    if row is None or row.ClientId != client_id:
-        raise HTTPException(status_code=404, detail="Event not found for this client")
-    partner = 1 if entry.IsClient1 else 2
+        if row and row.Tier is not None:
+            tiers.append(int(row.Tier))
+
+    if tiers:
+        stored_tier = max(tiers)
+        tier = max(stored_tier, entry.RiskTier or 1)
+        if entry.RiskTier is not None and entry.RiskTier < stored_tier:
+            log_study.warning("study-entries: app sent tier %s below stored tier %s for event %s",
+                              entry.RiskTier, stored_tier, entry.EventId)
+    elif AUTH_MODE != "enforce" and entry.RiskTier is not None:
+        # Older app builds: no SafetyAssessmentId and not yet linked.
+        log_study.warning("study-entries: no saved safety assessment for event %s; "
+                          "using the app's tier (report mode)", entry.EventId)
+        tier = entry.RiskTier
+    else:
+        raise HTTPException(status_code=409, detail="SAFETY_PENDING: save the safety assessment first, then retry.")
+
     status_ = study_ingest_entry(f"{client_id}-{partner}", f"event-{entry.EventId}",
-                                 entry.EntryCreatedAt, entry.EntryText, entry.RiskTier)
-    return {"status": status_}
+                                 entry.EntryCreatedAt, entry.EntryText, tier)
+    return {"status": status_, "tier": tier}
 
 class StudyAssessmentResponseIn(BaseModel):
     Assessment_Response_ID: int
@@ -1566,7 +1650,7 @@ class StudyReminderDeliveryIn(BaseModel):
     Source_Event_ID: str = Field(min_length=1, max_length=128)
 
 @app.post("/clients/{client_id}/study-reminder-deliveries")
-def ingest_study_reminder_delivery(client_id: int, body: StudyReminderDeliveryIn):
+def ingest_study_reminder_delivery(client_id: int, body: StudyReminderDeliveryIn, request: Request):
     """The app sends a reminder delivery record here (Attachment G, B2), only
     while the couple is in the feasibility study. Unlike study-entries and
     study-assessment-responses, there's no production table a reminder
@@ -1579,7 +1663,13 @@ def ingest_study_reminder_delivery(client_id: int, body: StudyReminderDeliveryIn
         cursor.execute("SELECT 1 FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
         if cursor.fetchone() is None:
             return {"status": "NOT_ENROLLED"}
-    partner = 1 if body.IsClient1 else 2
+        caller_partner = _caller_partner(request, cursor, client_id)
+    body_partner = 1 if body.IsClient1 else 2
+    if caller_partner is None:
+        authz_deny(request, "reminder delivery from someone other than the couple's partners")
+    elif caller_partner != body_partner:
+        authz_deny(request, "reminder delivery for the other partner")   # 403 in enforce
+    partner = caller_partner or body_partner
     status_ = study_ingest_reminder_delivery(
         f"{client_id}-{partner}", body.Source_Event_ID, body.Reminder_Type, body.Event_Type,
         body.Scheduled_At, body.Detected_At)
@@ -1634,6 +1724,14 @@ def create_event(event: EventCreate, request: Request):
     require_body_access(request, client_id=event.ClientId)
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        # A partner can only write events as themselves (therapists and admins
+        # aren't partners, so they're unaffected).
+        me = _caller_partner(request, cursor, event.ClientId)
+        if me is not None:
+            if not event.IsClient1 and not event.IsClient2:      # not set: fill in
+                event.IsClient1, event.IsClient2 = (me == 1), (me == 2)
+            elif (bool(event.IsClient1), bool(event.IsClient2)) != (me == 1, me == 2):
+                authz_deny(request, "event written as the other partner")   # 403 in enforce
         cursor.execute(
             "INSERT INTO Event (ClientId, IsClient1, IsClient2, Score, IsNeglect, IsRepair, IsShared, IsBid, IsSce, IsText, "
             "IsAudio, IsVideo, Affect, IsSharedDate, EventDate, TherapistNotes) "
@@ -2227,17 +2325,32 @@ def read_safety_assessment(assessment_id: int):
     return _get_safety_assessment(assessment_id, include_study_period=False)
 
 @app.put("/safety-assessments/{assessment_id}", response_model=SafetyAssessmentModel)
-def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpdate):
-    """Update a safety assessment"""
+def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpdate, request: Request):
+    """Update a safety assessment. A couple's own app may only link the
+    assessment to one of the couple's events, once; changing the tier, flags
+    or anything else is for therapists and admins."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id, RiskLabel FROM SafetyAssessment WHERE Id = ?", assessment_id)
+        cursor.execute("SELECT Id, RiskLabel, ClientId, EventId FROM SafetyAssessment WHERE Id = ?", assessment_id)
         current = cursor.fetchone()
         if not current:
             raise HTTPException(status_code=404, detail="Safety assessment not found")
 
         data = assessment.model_dump(exclude_unset=True)
+
+        c = getattr(request.state, "caller", None)
+        if c is not None and not (c.is_admin or c.is_therapist):
+            if set(data) - {"EventId"}:
+                authz_deny(request, "partner changing a safety assessment beyond linking its event")
+            elif current.EventId is not None and data.get("EventId") != current.EventId:
+                authz_deny(request, "partner relinking a safety assessment to a different event")
+
+        if data.get("EventId") is not None:
+            cursor.execute("SELECT ClientId FROM Event WHERE Id = ?", data["EventId"])
+            ev = cursor.fetchone()
+            if ev is None or ev.ClientId != current.ClientId:
+                raise HTTPException(status_code=400, detail="Event not found for this assessment's client")
 
         # Keep the stored tier on the five-tier scale (see _five_tier).
         if "RiskTier" in data or "RiskLabel" in data:
@@ -2245,11 +2358,6 @@ def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpd
             tier = _five_tier(data.get("RiskTier"), label)
             if tier is not None:
                 data["RiskTier"] = tier
-
-        if "EventId" in data and data["EventId"] is not None:
-            cursor.execute("SELECT Id FROM Event WHERE Id = ?", data["EventId"])
-            if not cursor.fetchone():
-                raise HTTPException(status_code=400, detail="Event not found")
 
         if data:
             updates = [f"{field} = ?" for field in data]
@@ -2266,8 +2374,11 @@ def update_safety_assessment(assessment_id: int, assessment: SafetyAssessmentUpd
         return _get_safety_assessment(assessment_id, include_study_period=True)
 
 @app.put("/safety-assessments/{assessment_id}/acknowledge", response_model=SafetyAssessmentModel)
-def acknowledge_safety_assessment(assessment_id: int, body: SafetyAssessmentAcknowledge):
+def acknowledge_safety_assessment(assessment_id: int, body: SafetyAssessmentAcknowledge, request: Request):
     """Mark a safety assessment as acknowledged by a therapist"""
+    c = getattr(request.state, "caller", None)
+    if c is not None and not (c.is_admin or c.is_therapist):
+        authz_deny(request, "only a therapist can acknowledge a safety assessment")   # 403 in enforce
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
