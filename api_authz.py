@@ -9,7 +9,8 @@ with an active role, and then
     Therapist    their own Therapist row(s), the couples assigned to them, and
                  those couples' events, session dates and safety assessments
                  (a therapist is any user whose email is a TherapistUserName)
-    Client       their own couple record and its events (the mobile app)
+    Client       their own couple record, its events and its questionnaire
+                 answers (the mobile app)
     anyone       their own AuthorizedUsers row, /auth/me, and read-only
                  study configuration (studies, assessments, questions, roles)
 
@@ -43,7 +44,8 @@ ADMIN_ROLE_NAMES = {"admin"}
 CLIENT_ROLE_NAMES = {"client"}
 
 # Read-only for any authorized user; writes are admin-only.
-CONFIG_READ_OPEN = {"roles", "studies", "assessments", "study-assessments", "study-questions"}
+CONFIG_READ_OPEN = {"roles", "studies", "assessments", "study-assessments", "study-questions",
+                    "study-answers"}
 # Item routes whose ownership is the row's ClientId.
 CLIENT_OWNED_TABLES = {"events": "Event", "session-dates": "SessionDate", "safety-assessments": "SafetyAssessment"}
 
@@ -213,6 +215,18 @@ def decide(method: str, path: str, query: dict, email: str) -> Tuple[Optional[st
         if m == "PUT" and len(rest) == 1 and not caller.is_therapist:
             return "therapist only", caller       # a client can't edit the couple record
         return None, caller
+
+    # The app's questionnaires post one answer per request. Item routes
+    # (GET/PUT/DELETE by response id) stay admin-only.
+    if head == "assessment-responses" and not rest:
+        if m == "POST":
+            return None, caller                   # endpoint checks body Client_ID and partner
+        if m == "GET":
+            cid = _int(query.get("client_id"))
+            if cid is None:
+                return "client_id required", caller
+            return (None if cid in caller.client_ids else "not your client"), caller
+        return "admin only", caller
 
     if head in CLIENT_OWNED_TABLES:
         if not rest:

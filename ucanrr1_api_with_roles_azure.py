@@ -101,6 +101,15 @@ def get_db_connection():
     finally:
         conn.close()
 
+def _insert_id(cursor, sql: str, *params) -> int:
+    """Run one INSERT and return the identity it created.
+
+    SCOPE_IDENTITY() in the same batch, unlike a later SELECT @@IDENTITY,
+    can't return an id written by a trigger on the table. NOCOUNT keeps the
+    INSERT's row count from being the first result set."""
+    cursor.execute(f"SET NOCOUNT ON; {sql}; SELECT CAST(SCOPE_IDENTITY() AS int)", *params)
+    return int(cursor.fetchone()[0])
+
 # ==================== PYDANTIC MODELS ====================
 
 # Role Models
@@ -676,8 +685,9 @@ def get_firebase_token(request: FirebaseTokenRequest):
         try:
             custom_token_bytes = firebase_auth.create_custom_token(email)
             custom_token = custom_token_bytes.decode("utf-8") if isinstance(custom_token_bytes, bytes) else custom_token_bytes
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to create Firebase token: {exc}")
+        except Exception:
+            log_study.exception("Failed to create Firebase custom token")
+            raise HTTPException(status_code=500, detail="Sign-in failed. Please try again.")
 
         # Update LastLogin
         cursor.execute(
@@ -761,14 +771,13 @@ def create_role(role: RoleCreate):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute(
+            new_id = _insert_id(
+                cursor,
                 "INSERT INTO Roles (RoleName, RedirectURL, Description, IsActive, CreatedAt) "
                 "VALUES (?, ?, ?, ?, GETDATE())",
                 role.RoleName, role.RedirectURL, role.Description, role.IsActive
             )
             conn.commit()
-            cursor.execute("SELECT @@IDENTITY")
-            new_id = cursor.fetchone()[0]
             cursor.execute(
                 "SELECT RoleID, RoleName, RedirectURL, Description, IsActive, CreatedAt "
                 "FROM Roles WHERE RoleID = ?", new_id
@@ -983,14 +992,13 @@ def create_authorized_user(user: AuthorizedUserCreate, request: Request):
                 raise HTTPException(status_code=400, detail="Invalid RoleID: Role not found")
 
         try:
-            cursor.execute(
+            new_id = _insert_id(
+                cursor,
                 "INSERT INTO AuthorizedUsers (Email, FullName, IsActive, CreatedAt, RoleID, HasInformedConsent) "
                 "VALUES (?, ?, ?, GETDATE(), ?, ?)",
                 user.Email, user.FullName, user.IsActive, user.RoleID, user.HasInformedConsent
             )
             conn.commit()
-            cursor.execute("SELECT @@IDENTITY")
-            new_id = cursor.fetchone()[0]
             cursor.execute(
                 "SELECT UserID, Email, FullName, IsActive, CreatedAt, LastLogin, RoleID, HasInformedConsent "
                 "FROM AuthorizedUsers WHERE UserID = ?", new_id
@@ -1278,14 +1286,13 @@ def create_therapist(therapist: TherapistCreate):
     forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Therapist (TherapistUserName, CreatedDate, UpdatedDate) "
             "VALUES (?, GETDATE(), GETDATE())",
             therapist.TherapistUserName
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Id, TherapistUserName, CreatedDate, UpdatedDate "
             "FROM Therapist WHERE Id = ?", new_id
@@ -1389,7 +1396,8 @@ def create_client(client: ClientCreate, request: Request):
     forget_caller()
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Client (TherapistID, Client1FirstName, Client1UserName, Client1Phone, "
             "Client2FirstName, Client2UserName, Client2Phone, CreatedDate, UpdatedDate) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, GETDATE(), GETDATE())",
@@ -1397,8 +1405,6 @@ def create_client(client: ClientCreate, request: Request):
             client.Client1Phone, client.Client2FirstName, client.Client2UserName, client.Client2Phone
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Id, TherapistID, Client1FirstName, Client1UserName, Client1Phone, "
             "Client2FirstName, Client2UserName, Client2Phone, CreatedDate, UpdatedDate FROM Client WHERE Id = ?", new_id
@@ -1732,7 +1738,8 @@ def create_event(event: EventCreate, request: Request):
                 event.IsClient1, event.IsClient2 = (me == 1), (me == 2)
             elif (bool(event.IsClient1), bool(event.IsClient2)) != (me == 1, me == 2):
                 authz_deny(request, "event written as the other partner")   # 403 in enforce
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Event (ClientId, IsClient1, IsClient2, Score, IsNeglect, IsRepair, IsShared, IsBid, IsSce, IsText, "
             "IsAudio, IsVideo, Affect, IsSharedDate, EventDate, TherapistNotes) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1741,8 +1748,6 @@ def create_event(event: EventCreate, request: Request):
             event.Affect, event.IsSharedDate, event.EventDate, event.TherapistNotes
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         return {**event.model_dump(), "Id": new_id}
 
 @app.get("/events/", response_model=List[Event])
@@ -2065,13 +2070,12 @@ def create_session_date(session_date: SessionDateCreate, request: Request):
         cursor.execute("SELECT Id FROM Client WHERE Id = ?", session_date.ClientId)
         if not cursor.fetchone():
             raise HTTPException(status_code=400, detail="Client not found")
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO SessionDate (ClientId, SessionDate) VALUES (?, ?)",
             session_date.ClientId, session_date.SessionDate
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         return {**session_date.model_dump(), "Id": new_id}
 
 @app.get("/session-dates/", response_model=List[SessionDateModel])
@@ -2237,7 +2241,8 @@ def create_safety_assessment(assessment: SafetyAssessmentCreate, request: Reques
             if not cursor.fetchone():
                 raise HTTPException(status_code=400, detail="Event not found")
 
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             """
             INSERT INTO SafetyAssessment (
                 EventId, ClientId, IsClient1, IsClient2, RiskTier, RiskLabel,
@@ -2261,9 +2266,6 @@ def create_safety_assessment(assessment: SafetyAssessmentCreate, request: Reques
             assessment.Explanation, assessment.ApiVersion
         )
         conn.commit()
-
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = int(cursor.fetchone()[0])
 
         cursor.execute(f"SELECT {_SA_COLUMNS} FROM SafetyAssessment WHERE Id = ?", new_id)
         return _sa_row(cursor.fetchone())
@@ -2419,14 +2421,13 @@ def create_study(study: StudyCreate):
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Study (Name, StartDate, Active, TherapistCount, ClientCount, EndDate, CreatedDate, UpdatedDate) "
             "VALUES (?, ?, ?, ?, ?, ?, GETDATE(), GETDATE())",
             study.Name, study.StartDate, study.Active, study.TherapistCount, study.ClientCount, study.EndDate
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Id, Name, StartDate, Active, TherapistCount, ClientCount, EndDate, CreatedDate, UpdatedDate "
             "FROM Study WHERE Id = ?", new_id
@@ -2570,7 +2571,8 @@ def create_assessment(assessment: AssessmentCreate):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute(
+            new_id = _insert_id(
+                cursor,
                 "INSERT INTO Assessment (AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 assessment.AssessmentCode, assessment.AssessmentName, assessment.Version,
@@ -2580,8 +2582,6 @@ def create_assessment(assessment: AssessmentCreate):
         except pyodbc.IntegrityError:
             raise HTTPException(status_code=400, detail="Assessment code already exists")
 
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Id, AssessmentCode, AssessmentName, Version, IntervalDays, IsEnabled, StartDate, EndDate, DateCreated, DateUpdated "
             "FROM Assessment WHERE Id = ?", new_id
@@ -2754,7 +2754,8 @@ def create_study_assessment(study_assessment: StudyAssessmentCreate):
             raise HTTPException(status_code=400, detail="Assessment not found")
 
         try:
-            cursor.execute(
+            new_id = _insert_id(
+                cursor,
                 "INSERT INTO Study_Assessment (Study_ID, Assessment_ID, IsEnabled) VALUES (?, ?, ?)",
                 study_assessment.Study_ID, study_assessment.Assessment_ID, study_assessment.IsEnabled
             )
@@ -2762,8 +2763,6 @@ def create_study_assessment(study_assessment: StudyAssessmentCreate):
         except pyodbc.IntegrityError:
             raise HTTPException(status_code=400, detail="This assessment is already assigned to this study")
 
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Study_Assessment_ID, Study_ID, Assessment_ID, IsEnabled, DateCreated, DateUpdated "
             "FROM Study_Assessment WHERE Study_Assessment_ID = ?", new_id
@@ -2907,15 +2906,14 @@ def create_study_question(study_question: StudyQuestionCreate):
         if not cursor.fetchone():
             raise HTTPException(status_code=400, detail="Study-assessment assignment not found")
 
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Study_Questions (Study_Assessment_ID, Question_Text, Question_Order, Question_Code) "
             "VALUES (?, ?, ?, ?)",
             study_question.Study_Assessment_ID, study_question.Question_Text,
             study_question.Question_Order, study_question.Question_Code
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Study_Question_ID, Study_Assessment_ID, Question_Text, Question_Order, Question_Code, DateCreated, DateUpdated "
             "FROM Study_Questions WHERE Study_Question_ID = ?", new_id
@@ -3048,15 +3046,14 @@ def create_study_answer(study_answer: StudyAnswerCreate):
         if not cursor.fetchone():
             raise HTTPException(status_code=400, detail="Study-assessment assignment not found")
 
-        cursor.execute(
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Study_Answers (Study_Question_ID, Study_Assessment_ID, Answer_Text, Answer_Value, Answer_Order) "
             "VALUES (?, ?, ?, ?, ?)",
             study_answer.Study_Question_ID, study_answer.Study_Assessment_ID, study_answer.Answer_Text,
             study_answer.Answer_Value, study_answer.Answer_Order
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Study_Answer_ID, Study_Question_ID, Study_Assessment_ID, Answer_Text, Answer_Value, Answer_Order, DateCreated, DateUpdated "
             "FROM Study_Answers WHERE Study_Answer_ID = ?", new_id
@@ -3210,22 +3207,31 @@ def _validate_assessment_response_fks(cursor, data: dict):
             raise HTTPException(status_code=400, detail="Study answer not found")
 
 @app.post("/assessment-responses/", response_model=AssessmentResponse, status_code=status.HTTP_201_CREATED)
-def create_assessment_response(response: AssessmentResponseCreate):
+def create_assessment_response(response: AssessmentResponseCreate, request: Request):
     """Create a new assessment response"""
+    require_body_access(request, client_id=response.Client_ID)
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
         _validate_assessment_response_fks(cursor, response.model_dump())
 
-        cursor.execute(
+        # A partner can only answer as themselves (therapists and admins
+        # aren't partners, so they're unaffected) -- same rule as create_event.
+        me = _caller_partner(request, cursor, response.Client_ID)
+        if me is not None:
+            if not response.IsClient1 and not response.IsClient2:   # not set: fill in
+                response.IsClient1, response.IsClient2 = (me == 1), (me == 2)
+            elif (bool(response.IsClient1), bool(response.IsClient2)) != (me == 1, me == 2):
+                authz_deny(request, "assessment answered as the other partner")   # 403 in enforce
+
+        new_id = _insert_id(
+            cursor,
             "INSERT INTO Assessment_Response (Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, IsClient1, IsClient2) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             response.Client_ID, response.Assessment_ID, response.Study_Question_ID,
             response.Study_Answer_ID, response.Answer_Value, response.IsClient1, response.IsClient2
         )
         conn.commit()
-        cursor.execute("SELECT @@IDENTITY")
-        new_id = cursor.fetchone()[0]
         cursor.execute(
             "SELECT Assessment_Response_ID, Client_ID, Assessment_ID, Study_Question_ID, Study_Answer_ID, Answer_Value, IsClient1, IsClient2, DateCreated, DateUpdated "
             "FROM Assessment_Response WHERE Assessment_Response_ID = ?", new_id
