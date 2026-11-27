@@ -270,6 +270,7 @@ class Event(EventBase):
 class SessionDateBase(BaseModel):
     ClientId: int
     SessionDate: date
+    FirstStudySession: bool = False
 
 class SessionDateCreate(SessionDateBase):
     pass
@@ -277,6 +278,7 @@ class SessionDateCreate(SessionDateBase):
 class SessionDateUpdate(BaseModel):
     ClientId: Optional[int] = None
     SessionDate: Optional[date] = None
+    FirstStudySession: Optional[bool] = None
 
 class SessionDateModel(SessionDateBase):
     Id: int
@@ -2070,10 +2072,13 @@ def create_session_date(session_date: SessionDateCreate, request: Request):
         cursor.execute("SELECT Id FROM Client WHERE Id = ?", session_date.ClientId)
         if not cursor.fetchone():
             raise HTTPException(status_code=400, detail="Client not found")
+        if session_date.FirstStudySession:
+            # Only one first study session per couple
+            cursor.execute("UPDATE SessionDate SET FirstStudySession = 0 WHERE ClientId = ?", session_date.ClientId)
         new_id = _insert_id(
             cursor,
-            "INSERT INTO SessionDate (ClientId, SessionDate) VALUES (?, ?)",
-            session_date.ClientId, session_date.SessionDate
+            "INSERT INTO SessionDate (ClientId, SessionDate, FirstStudySession) VALUES (?, ?, ?)",
+            session_date.ClientId, session_date.SessionDate, session_date.FirstStudySession
         )
         conn.commit()
         return {**session_date.model_dump(), "Id": new_id}
@@ -2091,7 +2096,7 @@ def read_session_dates(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = "SELECT Id, ClientId, SessionDate FROM SessionDate WHERE 1=1"
+        query = "SELECT Id, ClientId, SessionDate, FirstStudySession FROM SessionDate WHERE 1=1"
         params = []
 
         visible = visible_client_ids(request) if request is not None else None
@@ -2118,18 +2123,20 @@ def read_session_dates(
 
         cursor.execute(query, *params)
         rows = cursor.fetchall()
-        return [{"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate} for row in rows]
+        return [{"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate,
+                 "FirstStudySession": bool(row.FirstStudySession)} for row in rows]
 
 @app.get("/session-dates/{session_date_id}", response_model=SessionDateModel)
 def read_session_date(session_date_id: int):
     """Get a specific session date by ID"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT Id, ClientId, SessionDate FROM SessionDate WHERE Id = ?", session_date_id)
+        cursor.execute("SELECT Id, ClientId, SessionDate, FirstStudySession FROM SessionDate WHERE Id = ?", session_date_id)
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Session date not found")
-        return {"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate}
+        return {"Id": row.Id, "ClientId": row.ClientId, "SessionDate": row.SessionDate,
+                "FirstStudySession": bool(row.FirstStudySession)}
 
 @app.put("/session-dates/{session_date_id}", response_model=SessionDateModel)
 def update_session_date(session_date_id: int, session_date: SessionDateUpdate, request: Request):
@@ -2139,9 +2146,18 @@ def update_session_date(session_date_id: int, session_date: SessionDateUpdate, r
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id FROM SessionDate WHERE Id = ?", session_date_id)
-        if not cursor.fetchone():
+        cursor.execute("SELECT Id, ClientId FROM SessionDate WHERE Id = ?", session_date_id)
+        existing = cursor.fetchone()
+        if not existing:
             raise HTTPException(status_code=404, detail="Session date not found")
+
+        if session_date.FirstStudySession:
+            # Only one first study session per couple: clear it on the couple's other dates
+            owner = session_date.ClientId if session_date.ClientId is not None else existing.ClientId
+            cursor.execute(
+                "UPDATE SessionDate SET FirstStudySession = 0 WHERE ClientId = ? AND Id <> ?",
+                owner, session_date_id
+            )
 
         updates = []
         params = []
@@ -2155,7 +2171,7 @@ def update_session_date(session_date_id: int, session_date: SessionDateUpdate, r
                 f"UPDATE SessionDate SET {', '.join(updates)} WHERE Id = ?",
                 *params
             )
-            conn.commit()
+        conn.commit()
 
         return read_session_date(session_date_id)
 
