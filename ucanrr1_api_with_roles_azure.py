@@ -1502,8 +1502,20 @@ def read_client_study_status(client_id: int):
         cursor = conn.cursor()
         cursor.execute("SELECT Study_Start_At FROM dbo.vw_Study_Couple WHERE ClientId = ?", client_id)
         row = cursor.fetchone()
+        # When the couple consented: the later partner's consent. Kept out of
+        # the way of the safety display above if the view isn't there yet.
+        consent_at = None
+        if row is not None:
+            try:
+                cursor.execute("SELECT Couple_Consent_At FROM dbo.vw_Study_Couple_Consent WHERE ClientId = ?", client_id)
+                c = cursor.fetchone()
+                consent_at = c.Couple_Consent_At if c else None
+            except pyodbc.Error:
+                log_study.exception("study-status: dbo.vw_Study_Couple_Consent unavailable "
+                              "(run sql/study_patch_2026-11-27_couple_consent.sql)")
     return {"clientId": client_id, "inStudy": row is not None,
-            "studyStartAt": row.Study_Start_At if row else None}
+            "studyStartAt": row.Study_Start_At if row else None,
+            "coupleConsentAt": consent_at}
 
 class StudyEntryIn(BaseModel):
     # IsClient1 and RiskTier are still accepted so the current app keeps
@@ -2063,6 +2075,48 @@ def get_therapist_statistics(therapist_id: int):
 
 # ==================== SESSION DATE CRUD ====================
 
+def _as_date(value) -> Optional[date]:
+    if value is None or isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    return date.fromisoformat(str(value)[:10])
+
+def _fmt_day(d: date) -> str:
+    return f"{d.strftime('%b')} {d.day}, {d.year}"
+
+def _require_valid_first_session(cursor, client_id: int, session_day) -> None:
+    """A first study session needs a couple that has consented to the study,
+    on or after both the study start and the couple's consent: the later
+    partner's (vw_Study_Couple_Consent, sql/study_patch_2026-11-27). Couples
+    aren't linked to a Study row, so the study start is the earliest
+    Study.StartDate."""
+    session_day = _as_date(session_day)
+    cursor.execute("SELECT Couple_Consent_At FROM dbo.vw_Study_Couple_Consent WHERE ClientId = ?", client_id)
+    couple = cursor.fetchone()
+    if couple is None or couple.Couple_Consent_At is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This couple hasn't consented to the study yet. A first study session can only be "
+                   "marked after both partners have given research consent and the couple is enrolled."
+        )
+    cursor.execute("SELECT MIN(StartDate) AS StartDate FROM Study")
+    row = cursor.fetchone()
+    study_start = _as_date(row.StartDate) if row else None
+    if study_start is not None and session_day is not None and session_day < study_start:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The first study session must be on or after the study start date "
+                   f"({_fmt_day(study_start)})."
+        )
+    consented = _as_date(couple.Couple_Consent_At)
+    if session_day is not None and session_day < consented:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The first study session must be on or after the date this couple "
+                   f"consented to the study ({_fmt_day(consented)})."
+        )
+
 @app.post("/session-dates/", response_model=SessionDateModel, status_code=status.HTTP_201_CREATED)
 def create_session_date(session_date: SessionDateCreate, request: Request):
     """Create a new session date"""
@@ -2073,6 +2127,7 @@ def create_session_date(session_date: SessionDateCreate, request: Request):
         if not cursor.fetchone():
             raise HTTPException(status_code=400, detail="Client not found")
         if session_date.FirstStudySession:
+            _require_valid_first_session(cursor, session_date.ClientId, session_date.SessionDate)
             # Only one first study session per couple
             cursor.execute("UPDATE SessionDate SET FirstStudySession = 0 WHERE ClientId = ?", session_date.ClientId)
         new_id = _insert_id(
@@ -2146,14 +2201,21 @@ def update_session_date(session_date_id: int, session_date: SessionDateUpdate, r
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT Id, ClientId FROM SessionDate WHERE Id = ?", session_date_id)
+        cursor.execute("SELECT Id, ClientId, SessionDate, FirstStudySession FROM SessionDate WHERE Id = ?", session_date_id)
         existing = cursor.fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Session date not found")
 
+        # Check the date the row will have, also when only its date changes
+        owner = session_date.ClientId if session_date.ClientId is not None else existing.ClientId
+        will_be_first = (session_date.FirstStudySession if session_date.FirstStudySession is not None
+                         else bool(existing.FirstStudySession))
+        if will_be_first:
+            _require_valid_first_session(
+                cursor, owner, session_date.SessionDate or existing.SessionDate)
+
         if session_date.FirstStudySession:
             # Only one first study session per couple: clear it on the couple's other dates
-            owner = session_date.ClientId if session_date.ClientId is not None else existing.ClientId
             cursor.execute(
                 "UPDATE SessionDate SET FirstStudySession = 0 WHERE ClientId = ? AND Id <> ?",
                 owner, session_date_id
